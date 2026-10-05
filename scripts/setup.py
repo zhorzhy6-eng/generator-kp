@@ -384,7 +384,7 @@ def check_sources() -> bool:
 # ============================================
 
 
-def free_stale_output(bundle_name: str) -> None:
+def free_stale_output(bundle_name: str) -> bool:
     """
     Освобождает путь dist/<bundle_name>/ перед сборкой (режим onedir).
 
@@ -398,16 +398,27 @@ def free_stale_output(bundle_name: str) -> None:
     отдельная операция, которая в такой ситуации обычно проходит, после
     чего имя снова свободно.
 
+    Бывает и третий случай: папку держит процесс, у которого она является
+    рабочей (например, осиротевший консольный хост запущенной программы).
+    Тогда не проходит НИ удаление, НИ переименование — но внутрь папки
+    писать по-прежнему можно. Для этого случая сборка умеет работать через
+    временную папку (см. build_into_occupied_dir), а функция честно
+    возвращает False, чтобы вызывающий код выбрал этот путь.
+
+    Returns:
+        True  — путь свободен, можно собирать прямо в dist/;
+        False — папку освободить не удалось (сборка пойдёт обходным путём).
+
     Никакие данные пользователя здесь не трогаются: только наш dist/.
     """
     target = DIST_DIR / bundle_name
     if not target.exists():
-        return
+        return True
 
     try:
         shutil.rmtree(target)
         print(f"  ♻️  Удалена старая папка сборки: {bundle_name}\\")
-        return
+        return True
     except Exception as exc:
         print(f"  ⚠️  Не удалось удалить папку {bundle_name}\\: {exc}")
 
@@ -416,9 +427,97 @@ def free_stale_output(bundle_name: str) -> None:
     try:
         target.rename(stale)
         print(f"  ♻️  Папка была занята — отложена как {stale.name}\\")
+        return True
     except Exception as exc:
-        print(f"  ❌ Не удалось освободить {target}: {exc}")
-        print("     Закройте программу (если запущена) и повторите сборку.")
+        print(f"  ⚠️  Папку {bundle_name}\\ не удалось ни удалить, ни переименовать: {exc}")
+        print("     Соберу во временную папку и перенесу содержимое внутрь.")
+        return False
+
+
+def build_into_occupied_dir(spec: Path, bundle_name: str, exe_name: str) -> bool:
+    """
+    Собирает в отдельную папку и переносит результат в ЗАНЯТЫЙ dist/<bundle>.
+
+    Зачем это нужно: папку сборки может держать сторонний процесс (антивирус,
+    осиротевший консольный хост запущенной программы). Её нельзя ни удалить,
+    ни переименовать, поэтому PyInstaller не может собрать в неё напрямую —
+    COLLECT всегда сначала очищает целевой каталог.
+
+    Но блокируется только сама ПАПКА: удалять и создавать файлы ВНУТРИ неё
+    по-прежнему можно. Поэтому сборка идёт в dist_tmp, а затем содержимое
+    аккуратно переносится на место.
+
+    Returns:
+        True при успехе (в dist/<bundle> лежит свежий exe).
+    """
+    tmp_dist = PROJECT_ROOT / "dist_tmp"
+
+    print(f"     ⚙️  Обходной путь: сборка в {tmp_dist.name}\\")
+    try:
+        shutil.rmtree(tmp_dist)
+    except Exception:
+        pass
+
+    code = run(
+        [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            str(spec),
+            "--clean",
+            "--noconfirm",
+            "--distpath",
+            str(tmp_dist),
+            "--workpath",
+            str(BUILD_DIR),
+        ]
+    )
+
+    source_dir = tmp_dist / bundle_name
+    source_exe = source_dir / exe_name
+    if code != 0 or not source_exe.is_file():
+        print(f"     ❌ Сборка не удалась (код {code})")
+        try:
+            shutil.rmtree(tmp_dist)
+        except Exception:
+            pass
+        return False
+
+    target_dir = DIST_DIR / bundle_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    # Чистим ПРЕЖНЕЕ содержимое: файлы внутри занятой папки удаляются
+    # нормально, а смешивать две разные сборки в одной папке нельзя
+    # (останутся .dll от прошлой версии).
+    for item in list(target_dir.iterdir()):
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except Exception:
+            pass
+
+    transferred = 0
+    for item in source_dir.iterdir():
+        destination = target_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, destination)
+        transferred += 1
+
+    try:
+        shutil.rmtree(tmp_dist)
+    except Exception:
+        pass
+
+    if not (target_dir / exe_name).is_file():
+        print(f"     ❌ Не удалось перенести сборку в {target_dir}")
+        return False
+
+    print(f"     ✅ Перенесено элементов: {transferred} -> {target_dir}")
+    return True
 
 
 def cleanup_old_stale() -> None:
@@ -543,37 +642,46 @@ def build(spec: Path, label: str, bundle_name: str, exe_name: str) -> bool:
     # Освобождаем целевую папку: PyInstaller дописывает файлы в уже готовый
     # каталог, поэтому занятая папка (антивирус, запущенная копия программы,
     # остаток прерванной сборки) ломает сборку с PermissionError.
-    free_stale_output(bundle_name)
-
-    # Вызываем PyInstaller как модуль: так не зависим от того, попал ли
-    # pyinstaller.exe в PATH (частая проблема на Windows).
-    code = run(
-        [
-            sys.executable,
-            "-m",
-            "PyInstaller",
-            str(spec),
-            "--clean",
-            "--noconfirm",
-            "--distpath",
-            str(DIST_DIR),
-            "--workpath",
-            str(BUILD_DIR),
-        ]
-    )
+    path_is_free = free_stale_output(bundle_name)
 
     final_dir = DIST_DIR / bundle_name
     final_exe = final_dir / exe_name
-    # Проверяем именно папку с загрузчиком внутри: если PyInstaller по
-    # ошибке соберёт onefile, папки не будет и проверка это поймает.
-    if code != 0 or not final_exe.is_file():
-        print(f"     ❌ Сборка не удалась (код {code})")
-        if final_dir.is_dir() and not final_exe.is_file():
-            print(f"     Папка {bundle_name}\\ есть, но внутри нет {exe_name}.")
-        print("     Если в ошибке PermissionError — файлы держит антивирус.")
-        print("     Добавьте папку проекта в его исключения и повторите сборку.")
-        free_stale_output(bundle_name)
-        return False
+
+    if not path_is_free:
+        # Папку держит сторонний процесс — собираем в dist_tmp и переносим.
+        if not build_into_occupied_dir(spec, bundle_name, exe_name):
+            print(f"     ❌ Сборка не удалась")
+            print("     Закройте программу и повторите; если не помогает —")
+            print("     перезагрузите компьютер (папку держит системный процесс).")
+            return False
+    else:
+        # Вызываем PyInstaller как модуль: так не зависим от того, попал ли
+        # pyinstaller.exe в PATH (частая проблема на Windows).
+        code = run(
+            [
+                sys.executable,
+                "-m",
+                "PyInstaller",
+                str(spec),
+                "--clean",
+                "--noconfirm",
+                "--distpath",
+                str(DIST_DIR),
+                "--workpath",
+                str(BUILD_DIR),
+            ]
+        )
+
+        # Проверяем именно папку с загрузчиком внутри: если PyInstaller по
+        # ошибке соберёт onefile, папки не будет и проверка это поймает.
+        if code != 0 or not final_exe.is_file():
+            print(f"     ❌ Сборка не удалась (код {code})")
+            if final_dir.is_dir() and not final_exe.is_file():
+                print(f"     Папка {bundle_name}\\ есть, но внутри нет {exe_name}.")
+            print("     Если в ошибке PermissionError — файлы держит антивирус.")
+            print("     Добавьте папку проекта в его исключения и повторите сборку.")
+            free_stale_output(bundle_name)
+            return False
 
     print(f"     ✅ Сборка завершена: {final_dir}")
     print(f"        загрузчик {exe_name}: {mb(final_exe.stat().st_size):.1f} МБ")
