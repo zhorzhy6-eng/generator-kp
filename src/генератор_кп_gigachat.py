@@ -496,16 +496,26 @@ def _set_busy(busy: bool, message: str = "") -> None:
             pass
 
 
-def generate_text_async(on_done, use_cache: bool = True) -> None:
+def generate_text_async(on_done, use_cache: bool = True) -> bool:
     """
     Запускает генерацию в отдельном потоке, чтобы окно не «зависало».
 
     on_done(text, error) вызывается в главном потоке Tk через window.after(0, ...),
     потому что менять виджеты из фонового потока в Tkinter нельзя.
+
+    Returns:
+        True  — генерация поставлена в очередь;
+        False — уже идёт другая генерация, вызов проигнорирован.
     """
-    if _generation_in_progress:
-        logger.info("Генерация уже идёт — повторный запрос пропущен")
-        return
+    global _generation_in_progress
+
+    # Слот резервируется атомарно, ещё до старта потока: иначе два быстрых
+    # нажатия успевают проскочить проверку и запустить два запроса.
+    with _generation_lock:
+        if _generation_in_progress:
+            logger.info("Генерация уже идёт — повторный запрос пропущен")
+            return False
+        _generation_in_progress = True
 
     region = get_current_region()
     cities = get_selected_cities()
@@ -516,7 +526,7 @@ def generate_text_async(on_done, use_cache: bool = True) -> None:
         text = ""
         error = None
 
-        # Один запрос за раз: GigaChat-клиент не рассчитан на параллельные вызовы
+        # Один сетевой запрос за раз: клиент GigaChat не рассчитан на параллельность
         with _generation_lock:
             try:
                 text = generate_text_sync(region, cities, use_cache=use_cache)
@@ -542,6 +552,7 @@ def generate_text_async(on_done, use_cache: bool = True) -> None:
             pass
 
     threading.Thread(target=worker, name="gigachat-generate", daemon=True).start()
+    return True
 
 
 def refresh_preview_async() -> None:
