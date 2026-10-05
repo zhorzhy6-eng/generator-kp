@@ -102,9 +102,6 @@ exe = EXE(
     a.datas,
     [],
     name="Генератор_КП_Шаблон",
-    # suffix='.bin' — см. подробное объяснение в generator_kp.spec.
-    # Итоговое имя .exe присваивается последним шагом в scripts/setup.py.
-    suffix=".bin",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -328,15 +328,7 @@ def cleanup_old_stale() -> None:
 
 
 def build(spec: Path, label: str, exe_name: str) -> bool:
-    """
-    Собирает EXE по spec-файлу.
-
-    PyInstaller выпускает файл с расширением .bin (см. комментарий в spec),
-    а итоговое имя .exe присваивается здесь, последним шагом. Это обходит
-    блокировку на запись, которую антивирус/защита Windows накладывает на
-    только что созданный .exe: PyInstaller пишет файл в несколько приёмов,
-    и последний приём (дописывание архива) иначе падает с PermissionError.
-    """
+    """Собирает EXE по spec-файлу."""
     print(f"\n  📦 {label}")
     print(f"     spec: {spec.name}")
 
@@ -346,9 +338,9 @@ def build(spec: Path, label: str, exe_name: str) -> bool:
 
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_old_stale()
-
-    bin_name = Path(exe_name).with_suffix(".bin").name
-    free_stale_output(bin_name)
+    # Освобождаем целевой файл: PyInstaller ДОПИСЫВАЕТ данные в уже готовый
+    # .exe, поэтому занятый файл (антивирус, запущенная копия программы,
+    # остаток прерванной сборки) ломает сборку с PermissionError.
     free_stale_output(exe_name)
 
     # Вызываем PyInstaller как модуль: так не зависим от того, попал ли
@@ -368,23 +360,12 @@ def build(spec: Path, label: str, exe_name: str) -> bool:
         ]
     )
 
-    produced = DIST_DIR / bin_name
-    if code != 0 or not produced.is_file():
-        print(f"     ❌ Сборка не удалась (код {code})")
-        print("     Подсказка: если в ошибке PermissionError — файл блокирует")
-        print("     антивирус. Добавьте папку проекта в его исключения.")
-        free_stale_output(bin_name)
-        return False
-
-    # Последний шаг: .bin -> .exe
     final = DIST_DIR / exe_name
-    try:
-        if final.exists():
-            free_stale_output(exe_name)
-        produced.rename(final)
-    except Exception as exc:
-        print(f"     ⚠️  Собран файл {produced.name}, но переименовать не удалось: {exc}")
-        print(f"        Переименуйте вручную в {exe_name}")
+    if code != 0 or not final.is_file():
+        print(f"     ❌ Сборка не удалась (код {code})")
+        print("     Если в ошибке PermissionError — файл держит антивирус.")
+        print("     Добавьте папку проекта в его исключения и повторите сборку.")
+        free_stale_output(exe_name)
         return False
 
     size_mb = final.stat().st_size / (1024 * 1024)
