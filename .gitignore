@@ -44,3 +44,10 @@ Desktop.ini
 # === Прочее ===
 *.bak
 *.tmp
+
+# === Секреты (GigaChat API и т.п.) ===
+.env
+.env.local
+.env.*.local
+*.key
+!.env.example
