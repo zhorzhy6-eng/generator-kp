@@ -401,6 +401,80 @@ def cleanup_old_stale() -> None:
         pass
 
 
+def ensure_data_files(final_dir: Path) -> None:
+    """
+    Докладывает в папку сборки данные, которые в неё не кладёт PyInstaller.
+
+    Программа читает .env и сертификаты РЯДОМ С СОБОЙ (sys.executable.parent),
+    то есть внутри папки сборки. PyInstaller копирует только образец
+    .env.example, поэтому раньше ключ и сертификат Минцифры приходилось
+    переносить в dist вручную — и готовая папка без них не работала.
+
+    Что копируется (только если файл есть в проекте):
+      * .env               — рабочие настройки с ключом GigaChat;
+      * .env.example       — образец для новой машины;
+      * config\\ целиком    — сертификат Минцифры и настройки по умолчанию.
+
+    ВАЖНО: .env в Git не попадает (.gitignore). Здесь он копируется только
+    внутрь dist\\ — это локальная папка сборки, она тоже в .gitignore.
+    """
+    print("     данные рядом с EXE:")
+
+    # ---------- .env ----------
+    env_source = PROJECT_ROOT / ".env"
+    env_target = final_dir / ".env"
+    if env_source.is_file():
+        try:
+            shutil.copy2(env_source, env_target)
+            print("        ✅ .env — ключ GigaChat подхватится без ввода")
+        except Exception as exc:
+            print(f"        ⚠️  .env не скопирован: {exc}")
+    elif env_target.is_file():
+        # .env уже лежит в папке сборки (например, введён кнопкой «🔑 Ключ»
+        # при прошлом запуске) — затирать его пустотой нельзя.
+        print("        • .env уже есть в папке сборки — оставлен как есть")
+    else:
+        print("        • .env в проекте нет — программа попросит ключ при запуске")
+
+    # ---------- .env.example ----------
+    example_source = PROJECT_ROOT / ".env.example"
+    if example_source.is_file():
+        try:
+            shutil.copy2(example_source, final_dir / ".env.example")
+            print("        ✅ .env.example — образец настроек")
+        except Exception as exc:
+            print(f"        ⚠️  .env.example не скопирован: {exc}")
+
+    # ---------- config\ ----------
+    config_target = final_dir / "config"
+    if not CONFIG_DIR.is_dir():
+        print("        • папки config\\ в проекте нет — пропускаю")
+        return
+
+    try:
+        # Папку пересобираем целиком, иначе в ней остаются сертификаты
+        # от прошлых сборок и непонятно, что именно использует программа.
+        if config_target.is_dir():
+            shutil.rmtree(config_target)
+        shutil.copytree(CONFIG_DIR, config_target)
+    except Exception as exc:
+        print(f"        ⚠️  config\\ не скопирован: {exc}")
+        return
+
+    copied = sorted(p.name for p in config_target.iterdir() if p.is_file())
+    print(f"        ✅ config\\ — файлов: {len(copied)}" + (f" ({', '.join(copied)})" if copied else ""))
+
+    # Сертификат Минцифры — единственный файл, без которого GigaChat не
+    # заработает в сети с подменой TLS, поэтому о нём говорим отдельно.
+    ca_names = ("russian_trusted_root_ca.cer", "ca_bundle_merged.pem")
+    if any((config_target / name).is_file() for name in ca_names):
+        print("        ✅ сертификат для проверки TLS на месте")
+    else:
+        print("        ⚠️  сертификата Минцифры нет ни в config\\, ни рядом с программой.")
+        print("           Положите config\\russian_trusted_root_ca.cer и соберите заново,")
+        print("           либо нажмите «📋 Диагностика» в программе — она подскажет путь.")
+
+
 def build(spec: Path, label: str, bundle_name: str, exe_name: str) -> bool:
     """Собирает папку сборки (режим onedir) по spec-файлу."""
     print(f"\n  📦 {label}")
@@ -448,13 +522,18 @@ def build(spec: Path, label: str, bundle_name: str, exe_name: str) -> bool:
         free_stale_output(bundle_name)
         return False
 
-    total = dir_size_bytes(final_dir)
-    internal = final_dir / CONTENTS_DIR
-    internal_mb = mb(dir_size_bytes(internal)) if internal.is_dir() else 0.0
     print(f"     ✅ Сборка завершена: {final_dir}")
     print(f"        загрузчик {exe_name}: {mb(final_exe.stat().st_size):.1f} МБ")
+
+    internal = final_dir / CONTENTS_DIR
     if internal.is_dir():
-        print(f"        папка {CONTENTS_DIR}\\: {internal_mb:.1f} МБ")
+        print(f"        папка {CONTENTS_DIR}\\: {mb(dir_size_bytes(internal)):.1f} МБ")
+
+    # Данные кладём СРАЗУ после сборки: и пробный запуск, и копирование на
+    # рабочий стол должны работать с той же папкой, что получит пользователь.
+    ensure_data_files(final_dir)
+
+    total = dir_size_bytes(final_dir)
     print(f"        всего папка: {mb(total):.1f} МБ")
     return True
 
@@ -515,34 +594,24 @@ def copy_to_desktop(
         print(f"  ❌ Не удалось скопировать папку: {exc}")
         return False
 
-    # ---------- Докладываем образцы внутрь папки ----------
-    # Программа читает .env и config\ рядом с .exe (sys.executable),
-    # а .exe лежит в корне папки сборки — значит, файлы кладём туда же.
-    env_example = PROJECT_ROOT / ".env.example"
-    if env_example.is_file():
-        try:
-            shutil.copy2(env_example, target / ".env.example")
-            print("     внутрь папки положен .env.example (образец для ключа)")
-        except Exception as exc:
-            print(f"     ⚠️  .env.example не скопирован: {exc}")
+    # ---------- Проверяем, что данные доехали ----------
+    # В папке сборки уже лежат .env, .env.example и config\ (их положил
+    # ensure_data_files после сборки), а copytree выше перенёс их сюда
+    # целиком. Здесь только убеждаемся, что ничего не потерялось: раньше
+    # копировались лишь отдельные файлы, и сертификат Минцифры легко
+    # «терялся» по дороге.
+    if (target / ".env").is_file():
+        print("     ✅ .env — ключ GigaChat уже внутри, вводить не придётся")
+    else:
+        print("     • .env внутри нет — программа попросит ключ при первом запуске")
 
-    # Папка config\ рядом с .exe: программа ищет сертификат Минцифры именно
-    # там (_ca_bundle_dirs → sys.executable.parent/config). В сборке её нет
-    # «из коробки», поэтому создаём сразу — иначе пользователю пришлось бы
-    # угадывать, куда класть сертификат.
-    try:
-        (target / "config").mkdir(exist_ok=True)
-    except Exception as exc:
-        print(f"     ⚠️  Папка config не создана: {exc}")
-
-    for name in ("russian_trusted_root_ca.cer", "settings.example.json"):
-        item = CONFIG_DIR / name
-        if item.is_file():
-            try:
-                shutil.copy2(item, target / "config" / name)
-                print(f"     внутрь папки положен config/{name}")
-            except Exception as exc:
-                print(f"     ⚠️  config/{name} не скопирован: {exc}")
+    config_target = target / "config"
+    has_cert = (config_target / "russian_trusted_root_ca.cer").is_file()
+    has_bundle = config_target.is_dir() and any(config_target.glob("*.pem"))
+    if has_cert or has_bundle:
+        print("     ✅ config\\ — сертификат для проверки TLS на месте")
+    else:
+        print("     ⚠️  config\\ без сертификата — GigaChat может не ответить")
 
     total = dir_size_bytes(target)
     print(f"  ✅ {target}\\  ({mb(total):.1f} МБ)")

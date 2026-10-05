@@ -23,6 +23,7 @@
 
 import hashlib
 import os
+import ssl
 import sys
 import re
 import time
@@ -674,13 +675,11 @@ def _export_windows_roots_to_pem(
         "$all += Get-RootItems 'AuthRoot';"
         "$lines = foreach ($c in $all) {"
         "  if (-not ($wanted -contains $c.Thumbprint.ToUpper())) { continue }"
-        "  $der = $c.RawData;"
-        "  $b64 = [Convert]::ToBase64String($der, 'InsertLineBreaks');"
-        "  $pem = \"-----BEGIN CERTIFICATE-----\" + [Environment]::NewLine + $b64 + "
-        "[Environment]::NewLine + \"-----END CERTIFICATE-----\";"
+        "  $b64 = [Convert]::ToBase64String($c.RawData, 'InsertLineBreaks');"
+        "  $pem = \"-----BEGIN CERTIFICATE-----\" + [char]10 + $b64 + [char]10 + \"-----END CERTIFICATE-----\";"
         "  $s = $c.Subject.Replace([char]13, ' ').Replace([char]10, ' ').Trim();"
         "  $i = $c.Issuer.Replace([char]13, ' ').Replace([char]10, ' ').Trim();"
-        "  $esc = $pem.Replace([char]13, '').Replace([char]10, '\\n');"
+        "  $esc = $pem.Replace([char]13, [char]32).Replace([char]10, [char]126).Trim();"
         "  $c.Thumbprint.ToUpper() + '|' + $s.Replace('|', '/') + '|' + $i.Replace('|', '/') + '|' + $esc"
         "};"
         f"$lines -join ([char]10) | Out-File -FilePath '{quoted}' -Encoding utf8"
@@ -701,7 +700,9 @@ def _export_windows_roots_to_pem(
         if subject.strip() != issuer.strip():
             continue  # это не корень (сам себе не подписан) — в склейку не берём
 
-        pem = pem_flat.replace("\\n", "\n").strip() + "\n"
+        # В PowerShell перевод строки заменён на "~" (символ, которого в PEM
+        # не бывает), поэтому обратная замена однозначна.
+        pem = pem_flat.strip().replace("~", "\n").strip() + "\n"
         if "BEGIN CERTIFICATE" not in pem:
             continue
 
@@ -729,21 +730,55 @@ def _export_windows_roots_to_pem(
     return result
 
 
+def _read_cached_interceptor_pems(out_dir: Path) -> List[Tuple[Path, str]]:
+    """
+    Читает уже выгруженные корни SSL-инспекции (без обращения к Windows).
+
+    Имена файлов — отпечатки сертификатов этого и хватает, чтобы не
+    запускать PowerShell заново: содержимое проверяется при первом создании
+    файла, а папка живёт во временном каталоге пользователя.
+    """
+    result: List[Tuple[Path, str]] = []
+    try:
+        entries = sorted(out_dir.glob("*.pem"))
+    except OSError:
+        return result
+
+    for path in entries:
+        try:
+            pem = path.read_text(encoding="utf-8", errors="ignore")
+            der = ssl.PEM_cert_to_DER_cert(pem)
+        except Exception:
+            continue
+        if hashlib.sha1(der).hexdigest().upper() != path.stem.upper():
+            continue  # имя не совпало с содержимым — файл не наш
+        result.append((path, _cert_common_name(der) or path.stem))
+    return result
+
+
 def _interceptor_pem_files(exclude: Optional[Path] = None) -> List[Tuple[Path, str]]:
     """
     PEM-файлы корней SSL-инспекции из хранилища Windows (для склейки).
 
     Именно эти сертификаты подписывают подменённую цепочку, поэтому без них
     проверка TLS не пройдёт даже с сертификатом Минцифры.
+
+    Сначала проверяются уже выгруженные файлы (быстро, без запуска
+    PowerShell), и только если их нет — читается хранилище Windows.
     """
+    import tempfile
+
+    out_dir = Path(tempfile.gettempdir()) / "gigachat_roots"
+
+    cached = _read_cached_interceptor_pems(out_dir)
+    if cached:
+        return [(path, subject) for path, subject in cached if path != exclude]
+
     names = _scan_windows_root_names()
     candidates = _interceptor_candidates(names)
     if not candidates:
         return []
 
-    import tempfile
-
-    out_dir = Path(tempfile.gettempdir()) / "gigachat_roots"
     exported = _export_windows_roots_to_pem([t for _s, t in candidates], out_dir)
 
     return [(path, subject) for path, subject in exported if path != exclude]
@@ -872,34 +907,52 @@ def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
     )
     content = header + "\n".join(merged_blocks) + "\n"
 
-    try:
-        if target.is_file() and target.read_text(encoding="utf-8", errors="ignore") == content:
-            return target  # ничего не изменилось — файл не трогаем
-    except Exception:
-        pass
+    def try_write(path: Path) -> Optional[Path]:
+        """
+        Пытается записать склейку по указанному пути.
 
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        Файл не переписывается, если содержимое не изменилось: при каждом
+        запуске программы лишних обращений к диску нет.
+        """
+        try:
+            if path.is_file() and path.read_text(encoding="utf-8", errors="ignore") == content:
+                return path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return path
+        except Exception:
+            return None
+
+    import tempfile
+
+    # Порядок попыток: сначала config\ рядом с программой (файл виден
+    # пользователю), затем временная папка. Папка программы может быть
+    # защищена от записи (Program Files, права администратора, антивирус) —
+    # тогда программа всё равно должна получить рабочий набор сертификатов,
+    # а не остаться без проверки TLS.
+    written = try_write(target)
+    if written is None:
+        fallback = Path(tempfile.gettempdir()) / MERGED_CA_BUNDLE_FILENAME
+        written = try_write(fallback)
+        if written is not None:
+            log.info(
+                "SSL: папка config\\ недоступна для записи (%s) — набор "
+                "сертификатов собран во временной папке: %s",
+                target,
+                written,
+            )
+
+    if written is None:
+        log.warning("SSL: не удалось собрать объединённый набор сертификатов")
+        return None
+
+    if written == target:
         log.info(
             "SSL: сертификаты объединены в один файл (%s корней): %s",
             len(merged_blocks),
-            target,
+            written,
         )
-        return target
-    except Exception as exc:
-        log.warning("SSL: не удалось записать объединённый сертификат %s: %s", target, exc)
-
-    # Последняя попытка — во временной папке
-    try:
-        import tempfile
-
-        tmp_target = Path(tempfile.mkdtemp(prefix="gigachat_ca_")) / MERGED_CA_BUNDLE_FILENAME
-        tmp_target.write_text(content, encoding="utf-8")
-        log.info("SSL: склейка сертификатов записана во временную папку: %s", tmp_target)
-        return tmp_target
-    except Exception:
-        return None
+    return written
 
 
 def setup_ca_bundle(logger_: Optional[Any] = None) -> Optional[str]:
@@ -959,6 +1012,8 @@ def get_ca_bundle_status() -> Dict[str, Any]:
         merged_bundle:  путь к собранной склейке сертификатов (или None);
         merged_count:   сколько корней в склейке;
         interception:   Subject-ы корней антивируса из хранилища Windows;
+        store_scan:     удалось ли прочитать хранилище Windows
+                        («found» / «empty» / «skipped»);
         verify_ssl:     включена ли проверка сертификата;
         url:            официальный адрес загрузки сертификата.
     """
@@ -983,6 +1038,21 @@ def get_ca_bundle_status() -> Dict[str, Any]:
         except Exception:
             merged_count = 0
 
+    # Скан хранилища Windows идёт через PowerShell: ~0.3 с. Вызываем один раз
+    # и из результата достаём и признаки SSL-инспекции, и признак того, что
+    # проверка вообще состоялась (иначе «ничего не найдено» и «не смогли
+    # посмотреть» выглядели бы в диагностике одинаково).
+    store_names = _scan_windows_root_names()
+    if os.name != "nt":
+        store_scan = "skipped"
+    elif store_names:
+        store_scan = "found"
+    else:
+        store_scan = "empty"
+    interception = [
+        subject for subject, _thumb in _interceptor_candidates(store_names)
+    ]
+
     return {
         "found": str(found) if found else None,
         "expected": str(_ca_bundle_search_paths()[0]),
@@ -993,7 +1063,8 @@ def get_ca_bundle_status() -> Dict[str, Any]:
         "problem": get_ca_bundle_problem(),
         "merged_bundle": merged,
         "merged_count": merged_count,
-        "interception": detect_ssl_interception(),
+        "interception": interception,
+        "store_scan": store_scan,
         "verify_ssl": os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "true").strip().lower()
         != "false",
         "url": CA_BUNDLE_URL,
@@ -1047,6 +1118,24 @@ def log_ssl_error_context(error: Any, logger_: Optional[Any] = None) -> None:
             "подтверждается только этим сертификатом"
         )
 
+    if status.get("interception"):
+        log.error(
+            "SSL: в корневых сертификатах Windows найден корень SSL-инспекции "
+            "(антивирус или прокси подменяет сертификат):"
+        )
+        for subject in status["interception"]:
+            log.error("SSL:   - %s", subject)
+        log.error(
+            "SSL: этот корень добавлен в общий набор сертификатов программы. "
+            "Если ошибка осталась — добавьте программу в исключения "
+            "SSL-инспекции антивируса."
+        )
+    elif status.get("store_scan") == "empty":
+        log.error(
+            "SSL: список корневых сертификатов Windows прочитать не удалось — "
+            "проверить SSL-инспекцию автоматически нельзя"
+        )
+
     log.error("SSL: искали сертификат в:")
     for candidate in status["search_paths"]:
         log.error("SSL:   - %s", candidate)
@@ -1075,25 +1164,83 @@ def get_ssl_help() -> str:
     """
     Инструкция по исправлению SSL-ошибки — показывается в GUI и в логе.
 
-    Возвращает готовый текст, чтобы интерфейс и лог не расходились.
+    Текст собирается по фактическому состоянию: если сертификат уже найден,
+    не предлагаем его «скачать и положить», а объясняем следующую причину
+    (SSL-инспекция). Если SSL-инспекция обнаружена, называем виновника и
+    говорим, что программа уже добавила его корень в набор сертификатов.
     """
-    ca_path = _ca_bundle_dirs()[0] / CA_BUNDLE_FILENAME
-    return (
-        "⚠️ SSL-ошибка при обращении к GigaChat.\n\n"
-        "Возможные причины:\n"
-        "1. Корпоративный прокси или антивирус подменяет сертификаты\n"
-        "2. Не установлен корневой сертификат Минцифры\n\n"
-        "Решение:\n"
-        "1. Скачайте сертификат:\n"
-        f"   {CA_BUNDLE_URL}\n"
-        "2. Положите его в папку config рядом с программой:\n"
-        f"   {ca_path}\n"
-        "3. Либо пропишите свой путь в .env:\n"
-        "   GIGACHAT_CA_BUNDLE_FILE=C:\\certs\\russian_trusted_root_ca.cer\n"
-        "4. Перезапустите программу\n\n"
-        "Отключать GIGACHAT_VERIFY_SSL_CERTS не нужно: это убирает защиту\n"
-        "от подмены трафика, а проблему не решает."
-    )
+    status = {}
+    try:
+        status = get_ca_bundle_status()
+    except Exception:
+        pass
+
+    ca_path = PROJECT_ROOT / "config" / CA_BUNDLE_FILENAME
+    found = status.get("found")
+    interception = status.get("interception") or []
+    merged = status.get("merged_bundle")
+
+    lines: List[str] = ["⚠️ SSL-ошибка при обращении к GigaChat.", ""]
+
+    if found:
+        lines += [
+            "Сертификат Минцифры найден:",
+            f"   {found}",
+            "",
+        ]
+    else:
+        lines += [
+            "Корневой сертификат Минцифры НЕ найден.",
+            "1. Скачайте сертификат:",
+            f"   {CA_BUNDLE_URL}",
+            "2. Положите его в папку config рядом с программой:",
+            f"   {ca_path}",
+            "   (или просто рядом с программой — программа ищет и там)",
+            "3. Либо пропишите свой путь в .env:",
+            "   GIGACHAT_CA_BUNDLE_FILE=C:\\certs\\russian_trusted_root_ca.cer",
+            "",
+        ]
+
+    if interception:
+        lines += [
+            "🔎 Обнаружена SSL-инспекция — трафик проверяется на лету:",
+        ]
+        for subject in interception:
+            lines.append(f"   - {subject.split(',')[0].replace('CN=', '').strip()}")
+        lines += [
+            "Корень этой программы уже добавлен в общий набор сертификатов,",
+            "поэтому обычно ничего делать не нужно — перезапустите программу.",
+            "",
+            "Если ошибка осталась, исключите программу из SSL-инспекции:",
+            "   Kaspersky: Настройки → Сеть → Проверка защищённых соединений",
+            "              → Исключения → добавить Генератор_КП_GigaChat.exe",
+            "   Pro32:     Настройки → Защита → Исключения / SSL-инспекция",
+            "",
+        ]
+    else:
+        lines += [
+            "Второй возможный виновник — антивирус или корпоративный прокси,",
+            "который подменяет сертификат своим (SSL-инспекция).",
+            "Добавьте программу в его исключения:",
+            "   Kaspersky: Настройки → Сеть → Проверка защищённых соединений",
+            "              → Исключения",
+            "   Pro32:     Настройки → Защита → Исключения / SSL-инспекция",
+            "",
+        ]
+
+    if merged:
+        lines += [
+            "Программа проверяет TLS по своему набору сертификатов:",
+            f"   {merged}",
+            f"   корней в наборе: {status.get('merged_count') or '?'}",
+            "",
+        ]
+
+    lines += [
+        "Отключать GIGACHAT_VERIFY_SSL_CERTS не нужно: это убирает защиту",
+        "от подмены трафика, а проблему не решает.",
+    ]
+    return "\n".join(lines)
 
 
 def log_ssl_help(logger_: Optional[Any] = None) -> None:
@@ -1234,8 +1381,14 @@ def scrub_text(text: str) -> str:
 
 
 def get_gigachat_credentials() -> str:
-    """Возвращает Authorization Key из окружения (после загрузки .env)."""
-    return (os.environ.get("GIGACHAT_CREDENTIALS") or "").strip()
+    """
+    Возвращает Authorization Key из окружения (после загрузки .env).
+
+    Значение проходит через sanitize_key(): невидимые символы и случайные
+    пробелы, попавшие в .env при копировании, больше не превращают рабочий
+    ключ в «неверный».
+    """
+    return sanitize_key(os.environ.get("GIGACHAT_CREDENTIALS"))
 
 
 def is_gigachat_configured() -> bool:
@@ -1287,6 +1440,44 @@ def reset_gigachat_client() -> None:
     logger.info("Клиент GigaChat сброшен")
 
 
+# Невидимые символы, которые попадают в ключ при копировании из браузера и
+# из-за которых сервер отвечает «неверный ключ», хотя внешне строка верная.
+_INVISIBLE_CHARS = (
+    "\u200b",  # нулевой пробел
+    "\u200c",  # нулевой неприсоединяемый
+    "\u200d",  # нулевой присоединяемый
+    "\u2060",  # word joiner
+    "\ufeff",  # BOM
+    "\u00a0",  # неразрывный пробел
+)
+
+
+def sanitize_key(value: Optional[str]) -> str:
+    """
+    Приводит введённый ключ к виду, который понимает GigaChat.
+
+    Что убирается и почему:
+      * пробелы, табы и переводы строк — при вставке из письма или чата
+        ключ легко приезжает «с хвостом», и сервер его не принимает;
+      * кавычки по краям — многие копируют ключ вместе с ними;
+      * невидимые символы (нулевой пробел, BOM, неразрывный пробел) —
+        визуально ключ верный, а по байтам нет. Раньше такой ключ
+        сохранялся как есть, и программа сообщала «неверный ключ».
+
+    Само значение не изменяется: допустимые символы ключа (base64 и знаки
+    «-», «_») остаются нетронутыми.
+    """
+    if value is None:
+        return ""
+
+    text = str(value)
+    for ch in _INVISIBLE_CHARS:
+        text = text.replace(ch, "")
+    text = "".join(ch for ch in text if ch.isprintable())
+
+    return text.strip().strip("'\"").strip()
+
+
 def save_gigachat_key(key: str) -> Path:
     """
     Сохраняет ключ GigaChat в .env, который программа реально читает.
@@ -1306,7 +1497,14 @@ def save_gigachat_key(key: str) -> Path:
 
     Returns:
         Path к записанному файлу .env.
+
+    Raises:
+        ValueError: если после очистки от лишних символов ключ пуст.
     """
+    key = sanitize_key(key)
+    if not key:
+        raise ValueError("Ключ пуст")
+
     env_path = get_env_write_path()
     env_path.parent.mkdir(parents=True, exist_ok=True)
 

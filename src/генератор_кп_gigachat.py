@@ -37,6 +37,7 @@ from logger_config import setup_logger, SETTINGS_PATH, PROJECT_ROOT, LOG_FILE as
 # Единый провайдер LLM (GigaChat + Ollama)
 from llm_provider import (
     DEFAULT_SYSTEM_PROMPT,
+    detect_ssl_interception,
     generate_gigachat,
     get_ca_bundle_status,
     get_env_write_path,
@@ -44,6 +45,7 @@ from llm_provider import (
     get_status_info,
     has_ssl_error,
     is_gigachat_configured,
+    sanitize_key,
     save_gigachat_key,
     warmup_gigachat,
 )
@@ -1081,6 +1083,50 @@ def _diag_certificate_section() -> List[str]:
             "      Программа при этом работает: текст КП берётся из шаблонов."
         )
 
+    # Что именно ушло в проверку TLS: сертификат Минцифры сам по себе мало
+    # помогает, если антивирус подменяет цепочку — поэтому программа
+    # собирает один файл из всех нужных корней и показывает его состав.
+    if expected.get("problem"):
+        lines.append(f"⚠️ Проблема с файлом сертификата: {expected['problem']}")
+
+    merged = expected.get("merged_bundle")
+    if merged:
+        count = expected.get("merged_count") or 0
+        lines.append(f"✅ Набор для проверки TLS собран ({count} корней):")
+        lines.append(f"   {merged}")
+    elif expected.get("found"):
+        lines.append(
+            "   ℹ️ Набор соберётся при первом обращении к GigaChat "
+            "(см. запись в логе)."
+        )
+
+    interception = expected.get("interception") or []
+    if interception:
+        lines.append("")
+        lines.append("🔎 Обнаружена SSL-инспекция (проверка трафика на лету):")
+        for subject in interception:
+            short = subject.split(",")[0].replace("CN=", "").strip()
+            lines.append(f"   - {short}")
+        lines.append(
+            "   Корень антивируса добавлен в набор сертификатов, поэтому"
+        )
+        lines.append(
+            "   GigaChat может работать и без отключения проверки."
+        )
+        lines.append(
+            "   Если SSL-ошибка останется — исключите программу из"
+        )
+        lines.append(
+            "   SSL-инспекции антивируса (Kaspersky: Настройки → Сеть →"
+        )
+        lines.append("   Проверка защищённых соединений → Исключения).")
+    elif expected.get("store_scan") == "empty":
+        lines.append("")
+        lines.append(
+            "ℹ️ Список корневых сертификатов Windows прочитать не удалось —"
+        )
+        lines.append("   проверить SSL-инспекцию автоматически нельзя.")
+
     lines.append("")
     lines.append("🔎 Где искали сертификат:")
     for candidate in expected.get("search_paths", []):
@@ -1404,8 +1450,55 @@ def enter_api_key():
 
     # show="*" — ключ не отображается на экране
     key_entry = tk.Entry(dialog, width=55, font=("Arial", 9), show="*")
-    key_entry.pack(padx=20, pady=10)
+    key_entry.pack(padx=20, pady=(10, 2))
     key_entry.focus_set()
+
+    # Счётчик символов: благодаря ему видно, что вставка сработала. Раньше
+    # при пустом поле (например, Ctrl+V не сработал) кнопка «Сохранить»
+    # отвечала «Ключ не введён» — и было непонятно, почему.
+    key_hint = tk.Label(
+        dialog,
+        text="Длина ключа: 0 символов",
+        font=("Arial", 8),
+        fg="#888",
+        bg=BG_COLOR,
+    )
+    key_hint.pack()
+
+    def _update_key_hint(event=None) -> None:
+        """Показывает, сколько символов реально попало в поле."""
+        try:
+            length = len(key_entry.get())
+        except Exception:
+            return
+        key_hint.config(
+            text=f"Длина ключа: {length} символов"
+            + ("" if length else "  ← поле пустое"),
+            fg="#888" if length else "#c62828",
+        )
+
+    def _paste_key(event=None) -> str:
+        """
+        Вставляет ключ из буфера обмена, очищая лишние символы.
+
+        Зачем свой обработчик: при копировании из браузера в ключ часто
+        попадают пробелы, кавычки и невидимые символы. Внешне ключ верный,
+        а сервер отвечает «неверный ключ» — поэтому чистим сразу при вставке.
+        """
+        try:
+            text = window.clipboard_get()
+        except Exception:
+            # Буфер пуст или занят другим приложением — отдаём событие Tkinter
+            return ""
+        key_entry.delete(0, "end")
+        key_entry.insert(0, sanitize_key(text))
+        _update_key_hint()
+        return "break"
+
+    key_entry.bind("<KeyRelease>", _update_key_hint)
+    key_entry.bind("<Control-v>", _paste_key)
+    key_entry.bind("<Control-V>", _paste_key)
+    key_entry.bind("<<Paste>>", _paste_key)
 
     tk.Label(
         dialog,
@@ -1418,10 +1511,23 @@ def enter_api_key():
     def save():
         global GIGACHAT_READY, GIGACHAT_MODEL
 
-        key = key_entry.get().strip()
+        # sanitize_key убирает пробелы, кавычки и невидимые символы, которые
+        # попадают в ключ при копировании. Раньше такой ключ сохранялся
+        # «как есть», и GigaChat отвечал «неверный ключ» при верном значении.
+        key = sanitize_key(key_entry.get())
 
         if not key:
-            messagebox.showwarning("Внимание", "Ключ не введён.", parent=dialog)
+            key_hint.config(
+                text="Длина ключа: 0 символов  ← поле пустое", fg="#c62828"
+            )
+            messagebox.showwarning(
+                "Внимание",
+                "Ключ не введён.\n\n"
+                "Вставьте Authorization Key в поле (Ctrl+V) и нажмите "
+                "«Сохранить» ещё раз.",
+                parent=dialog,
+            )
+            key_entry.focus_set()
             return
 
         try:
@@ -1450,7 +1556,16 @@ def enter_api_key():
         except NameError:
             pass
 
-        logger.info("Ключ GigaChat сохранён в .env и активирован (значение не логируется)")
+        # Плашка «❌ Ключ не задан» больше не нужна — ключ только что сохранён
+        try:
+            update_key_banner()
+        except Exception as exc:
+            logger.debug("Не удалось обновить плашку ключа: %s", exc)
+
+        logger.info(
+            "Ключ GigaChat сохранён в %s и активирован (значение не логируется)",
+            env_path,
+        )
 
         if messagebox.askyesno(
             "Готово!",
@@ -1617,18 +1732,37 @@ status_label = tk.Label(
 )
 status_label.pack()
 
-# Если ключа нет — сразу говорим, что делать (а не просто красная строка)
-if not GIGACHAT_READY:
-    key_warning_label = tk.Label(
-        header_frame,
-        text="⚠️ Ключ GigaChat не задан. Нажмите 🔑 для ввода",
-        font=("Arial", 9, "bold"),
-        fg="#b71c1c",
-        bg="#ffe0e0",
-        padx=8,
-        pady=3,
-    )
-    key_warning_label.pack(pady=3)
+# Если ключа нет — сразу говорим, что делать (а не просто красная строка).
+# Плашка создаётся всегда, а видимостью управляет update_key_banner():
+# после ввода ключа кнопкой «🔑 Ключ» она должна исчезать без перезапуска.
+key_warning_label = tk.Label(
+    header_frame,
+    text="⚠️ Ключ GigaChat не задан. Нажмите 🔑 для ввода",
+    font=("Arial", 9, "bold"),
+    fg="#b71c1c",
+    bg="#ffe0e0",
+    padx=8,
+    pady=3,
+)
+
+
+def update_key_banner() -> None:
+    """
+    Показывает или скрывает плашку «Ключ GigaChat не задан».
+
+    Нужна после сохранения ключа из интерфейса: раньше плашка оставалась
+    на экране до перезапуска и выглядела как «ключ не сохранился», хотя
+    .env уже был обновлён и ключ работал.
+    """
+    if GIGACHAT_READY:
+        if key_warning_label.winfo_manager():
+            key_warning_label.pack_forget()
+    else:
+        if not key_warning_label.winfo_manager():
+            key_warning_label.pack(pady=3)
+
+
+update_key_banner()
 
 # Плашка про SSL. Показывается в двух случаях:
 #   1. СРАЗУ при старте — сертификата Минцифры нет, а ключ задан. Тогда
@@ -1685,12 +1819,26 @@ def _startup_ssl_check() -> None:
         cert_ok = _certificate_present()
 
         if GIGACHAT_READY and not cert_ok:
-            logger.warning(
-                "SSL: корневой сертификат Минцифры не найден — GigaChat, "
-                "скорее всего, не ответит. Программа будет работать на "
-                "шаблонах. Скачать сертификат: %s",
-                get_ca_bundle_status().get("url"),
-            )
+            interception = detect_ssl_interception()
+            if interception:
+                # Корень антивируса программа добавляет в набор сама, поэтому
+                # без сертификата Минцифры GigaChat всё равно, скорее всего,
+                # не ответит — предупреждаем и называем виновника.
+                logger.warning(
+                    "SSL: корневой сертификат Минцифры не найден, а в системе "
+                    "включена SSL-инспекция (%s). GigaChat, скорее всего, не "
+                    "ответит — программа будет работать на шаблонах. "
+                    "Сертификат: %s",
+                    ", ".join(s.split(",")[0] for s in interception),
+                    get_ca_bundle_status().get("url"),
+                )
+            else:
+                logger.warning(
+                    "SSL: корневой сертификат Минцифры не найден — GigaChat, "
+                    "скорее всего, не ответит. Программа будет работать на "
+                    "шаблонах. Скачать сертификат: %s",
+                    get_ca_bundle_status().get("url"),
+                )
 
         update_ssl_banner(cert_ok)
     except Exception as exc:  # pragma: no cover
