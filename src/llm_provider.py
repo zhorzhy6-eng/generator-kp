@@ -17,7 +17,10 @@
 Принципы скорости:
   * Клиент GigaChat создаётся лениво и кэшируется (singleton) — токен и
     TLS-соединение переиспользуются между запросами
-  * Генерация идёт потоково (stream=True): текст начинает приходить сразу
+  * Генерация идёт ОБЫЧНЫМ (непотоковым) запросом: стриминг в сетях с
+    SSL-инспекцией (Kaspersky, Pro32) обрывается, поэтому он отключён по
+    умолчанию и включается только явным use_stream=True
+  * Короткий промпт и небольшой max_tokens — меньше текста, быстрее ответ
   * Есть отдельная функция warmup() для прогрева авторизации в фоне
 """
 
@@ -1498,7 +1501,36 @@ except Exception:  # pragma: no cover
 
 DEFAULT_GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
 DEFAULT_GIGACHAT_MODEL = "GigaChat"
-DEFAULT_GIGACHAT_TIMEOUT = 30.0
+
+# Таймаут одного запроса к GigaChat, секунды.
+#
+# 60 с — это «потолок ожидания», а не обычное время ответа (нормальный ответ
+# приходит за 1–3 с). Запас нужен для медленных сетей: при 30 с запрос мог
+# обрываться ровно на середине генерации. Переопределяется GIGACHAT_TIMEOUT
+# в .env.
+DEFAULT_GIGACHAT_TIMEOUT = 60.0
+
+# Адрес API GigaChat.
+#
+# ВАЖНО, это главная причина ошибки [WinError 10060].
+# Начиная с версии 0.2.0 библиотека gigachat по умолчанию ходит на
+# https://api.giga.chat/v1 (PR #119 проекта ai-forever/gigachat). Этот адрес
+# доступен НЕ из всех сетей: TCP-соединение к нему просто не устанавливается
+# (пакеты отбрасываются), и запрос падает с ConnectTimeout [WinError 10060],
+# хотя авторизация при этом проходит — она идёт на другой хост и работает.
+#
+# Классический адрес Сбера работает стабильно, поэтому задан явно и по
+# умолчанию. Переопределяется переменной GIGACHAT_BASE_URL в .env — тогда
+# можно увести трафик на прокси или на новый адрес, не трогая код.
+DEFAULT_GIGACHAT_BASE_URL = "https://gigachat.devices.sberbank.ru/api/v1"
+
+# Сколько раз повторять запрос при сетевом таймауте и пауза между попытками.
+# Первая попытка + один повтор: соединение иногда не устанавливается с
+# первого раза (файрвол, антивирус, нестабильный канал), а второй заход
+# проходит нормально.
+_GIGACHAT_ATTEMPTS = 2
+_GIGACHAT_RETRY_DELAY = 1.5
+
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_OLLAMA_MODEL = "llama3.2"
 DEFAULT_OLLAMA_TIMEOUT = 20
@@ -1523,6 +1555,28 @@ _AUTH_ERROR_NAMES = {
     "AuthenticationError",
     "AuthorizationError",
 }
+
+# Имена исключений, означающие «соединение не установилось / оборвалось».
+# Такие запросы имеет смысл повторить: сервис тут ни при чём, дело в сети.
+_CONNECT_ERROR_NAMES = {
+    "ConnectTimeout",
+    "ConnectError",
+    "ConnectionError",
+    "ConnectionResetError",
+    "ReadTimeout",
+    "TimeoutException",
+    "Timeout",
+}
+
+# Текстовые маркеры того же самого — на случай, если ошибка пришла обёрнутой
+# в чужое исключение и по имени типа её не узнать.
+_CONNECT_ERROR_MARKERS = (
+    "winerror 10060",
+    "connecttimeout",
+    "connect timeout",
+    "connection timed out",
+    "connection aborted",
+)
 
 # ============================================
 # МАСКИРОВАНИЕ СЕКРЕТОВ
@@ -1632,6 +1686,19 @@ _gigachat_config_key: Optional[tuple] = None
 _gigachat_client_timeout: Optional[float] = None
 
 
+def _resolve_base_url() -> str:
+    """
+    Возвращает адрес API GigaChat.
+
+    Приоритет: GIGACHAT_BASE_URL из .env → DEFAULT_GIGACHAT_BASE_URL.
+    Пустое значение в .env считается «не задано»: раньше пустая строка
+    означала «взять адрес библиотеки по умолчанию», а он (api.giga.chat)
+    доступен не из всех сетей — из-за этого запросы и падали.
+    """
+    configured = (os.environ.get("GIGACHAT_BASE_URL") or "").strip()
+    return configured or DEFAULT_GIGACHAT_BASE_URL
+
+
 def _current_config_key() -> tuple:
     """Отпечаток конфигурации: при её смене клиент пересоздаётся."""
     return (
@@ -1640,6 +1707,9 @@ def _current_config_key() -> tuple:
         os.environ.get("GIGACHAT_MODEL", DEFAULT_GIGACHAT_MODEL),
         os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "true"),
         os.environ.get("GIGACHAT_CA_BUNDLE_FILE", ""),
+        # Адрес входит в отпечаток: сменили GIGACHAT_BASE_URL — клиент
+        # пересоздастся сам, старый останется ходить на прежний хост.
+        _resolve_base_url(),
     )
 
 
@@ -1746,13 +1816,19 @@ def save_gigachat_key(key: str) -> Path:
         lines = [
             "GIGACHAT_SCOPE=GIGACHAT_API_PERS",
             "GIGACHAT_MODEL=GigaChat",
-            "GIGACHAT_TIMEOUT=30",
+            f"GIGACHAT_TIMEOUT={int(DEFAULT_GIGACHAT_TIMEOUT)}",
             "GIGACHAT_VERIFY_SSL_CERTS=true",
             "GIGACHAT_CA_BUNDLE_FILE=",
+            f"GIGACHAT_BASE_URL={DEFAULT_GIGACHAT_BASE_URL}",
         ]
-    elif not any(line.startswith("GIGACHAT_CA_BUNDLE_FILE") for line in lines):
-        # Сохраняем настройку SSL, даже если её не было в старом файле
-        lines.append("GIGACHAT_CA_BUNDLE_FILE=")
+    else:
+        # Обе настройки дописываем независимо друг от друга: старый .env
+        # может не содержать ни одной, ни другой. Без GIGACHAT_BASE_URL
+        # библиотека уходит на недоступный api.giga.chat.
+        if not any(line.startswith("GIGACHAT_CA_BUNDLE_FILE") for line in lines):
+            lines.append("GIGACHAT_CA_BUNDLE_FILE=")
+        if not any(line.startswith("GIGACHAT_BASE_URL") for line in lines):
+            lines.append(f"GIGACHAT_BASE_URL={DEFAULT_GIGACHAT_BASE_URL}")
 
     lines.append(f"GIGACHAT_CREDENTIALS={key}")
 
@@ -1852,7 +1928,7 @@ def _get_gigachat_client(timeout: Optional[float] = None) -> Optional[Any]:
     setup_ca_bundle()
     ca_bundle = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip() or None
 
-    base_url = (os.environ.get("GIGACHAT_BASE_URL") or "").strip() or None
+    base_url = _resolve_base_url()
 
     client_kwargs: Dict[str, Any] = {
         "credentials": credentials,
@@ -1861,10 +1937,11 @@ def _get_gigachat_client(timeout: Optional[float] = None) -> Optional[Any]:
         "timeout": timeout,
         "verify_ssl_certs": verify_ssl,
         "ca_bundle_file": ca_bundle,
+        # Адрес задаём ВСЕГДА и явно. Полагаться на значение по умолчанию
+        # нельзя: с gigachat 0.2.0 это api.giga.chat, недоступный из части
+        # сетей (см. DEFAULT_GIGACHAT_BASE_URL).
+        "base_url": base_url,
     }
-    if base_url:
-        # Позволяет работать через прокси, если прямой доступ закрыт
-        client_kwargs["base_url"] = base_url
 
     try:
         client = GigaChat(**client_kwargs)
@@ -1879,10 +1956,11 @@ def _get_gigachat_client(timeout: Optional[float] = None) -> Optional[Any]:
         # ВАЖНО: сам ключ не логируем — только маску
         logger.info(
             "Клиент GigaChat создан | credentials=%s | scope=%s | model=%s | "
-            "timeout=%sс | verify_ssl=%s | ca_bundle=%s",
+            "base_url=%s | timeout=%sс | verify_ssl=%s | ca_bundle=%s",
             mask_credentials(credentials),
             scope,
             model,
+            base_url,
             timeout,
             verify_ssl,
             ca_bundle or "системный",
@@ -2016,10 +2094,16 @@ def _generate_gigachat_streaming(
     client: Any, system_prompt: str, prompt: str, temperature: float, max_tokens: int
 ) -> str:
     """
-    Потоковая генерация: текст приходит по мере готовности.
+    Потоковая генерация (stream=True): текст приходит по мере готовности.
 
-    Это быстрее по ощущениям (и экономит время на разбор полного ответа),
-    поэтому используется как основной путь.
+    ВНИМАНИЕ: по умолчанию НЕ используется, и это осознанно.
+    В сетях с SSL-инспекцией (Kaspersky, Pro32 и подобные) подмена
+    сертификата рвёт длинную HTTPS-сессию: соединение открывается, но поток
+    чанков не доходит, и запрос умирает по ConnectTimeout. Именно поэтому
+    основной путь — _generate_gigachat_sync(), а эта функция вызывается
+    только при явном use_stream=True (например, в сети без инспекции).
+
+    Хвост «stream» оставлен как возможность, а не как рабочий режим.
     """
     from gigachat.models import Chat, Messages, MessagesRole
 
@@ -2045,7 +2129,7 @@ def _generate_gigachat_streaming(
 def _generate_gigachat_sync(
     client: Any, system_prompt: str, prompt: str, temperature: float, max_tokens: int
 ) -> str:
-    """Обычная (непотоковая) генерация — фолбэк, если стриминг не сработал."""
+    """Обычная (непотоковая) генерация — основной режим работы."""
     from gigachat.models import Chat, Messages, MessagesRole
 
     payload = Chat(
@@ -2060,12 +2144,77 @@ def _generate_gigachat_sync(
     return _extract_message_content(client.chat(payload))
 
 
+def is_connect_timeout_error(error: Any) -> bool:
+    """
+    Ошибка означает «соединение не установилось / оборвалось по сети».
+
+    Такие сбои имеет смысл повторять: сервис тут ни при чём, дело в канале,
+    файрволе или антивирусе, и вторая попытка часто проходит.
+
+    SSL-ошибки сюда НЕ попадают: там проблема в сертификате, и повтор
+    ничего не изменит — только зря прождём таймаут.
+    """
+    if is_ssl_error(error):
+        return False
+
+    if type(error).__name__ in _CONNECT_ERROR_NAMES:
+        return True
+
+    text = scrub_text(str(error)).lower()
+    return any(marker in text for marker in _CONNECT_ERROR_MARKERS)
+
+
+def _generate_gigachat_sync_with_retry(
+    client: Any,
+    system_prompt: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+    attempts: int = _GIGACHAT_ATTEMPTS,
+) -> str:
+    """
+    Синхронная генерация с одной повторной попыткой при сетевом таймауте.
+
+    Повторяем ТОЛЬКО сетевые сбои (ConnectTimeout / WinError 10060 и родню).
+    Ошибку авторизации, SSL или ответ 4xx повторять бессмысленно — она
+    повторится ровно так же, а пользователь прождёт лишний таймаут.
+
+    Если повтор не помог, наружу уходит последняя ошибка: вызывающий код
+    логирует её и уходит в шаблонный текст (fallback сохранён).
+    """
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return _generate_gigachat_sync(
+                client, system_prompt, prompt, temperature, max_tokens
+            )
+        except Exception as e:
+            last_error = e
+
+            if attempt >= attempts or not is_connect_timeout_error(e):
+                raise
+
+            logger.warning(
+                "GigaChat: сетевой сбой (%s), попытка %d из %d — "
+                "повторяю запрос через %.1f сек",
+                scrub_text(str(e))[:200],
+                attempt,
+                attempts,
+                _GIGACHAT_RETRY_DELAY,
+            )
+            time.sleep(_GIGACHAT_RETRY_DELAY)
+
+    # Сюда попасть нельзя: цикл либо вернёт текст, либо выбросит исключение.
+    raise last_error if last_error is not None else RuntimeError("GigaChat: нет попыток")
+
+
 def generate_gigachat(
     prompt: str,
     system_prompt: Optional[str] = None,
     temperature: float = 0.85,
     max_tokens: int = 280,
-    use_stream: bool = True,
+    use_stream: bool = False,
     timeout: Optional[float] = None,
 ) -> Optional[str]:
     """
@@ -2076,9 +2225,11 @@ def generate_gigachat(
         system_prompt: системная роль (по умолчанию — копирайтер по автоперевозкам)
         temperature:   креативность (0.0–2.0)
         max_tokens:    ограничение длины ответа (меньше = быстрее)
-        use_stream:    потоковая генерация (быстрее отдаёт первый токен)
+        use_stream:    ВЫКЛЮЧЕНО по умолчанию. Потоковая генерация в сетях
+                       с SSL-инспекцией рвётся по таймауту, поэтому рабочий
+                       режим — обычный запрос. Включать только осознанно.
         timeout:       таймаут запроса в секундах; None — взять GIGACHAT_TIMEOUT
-                       из .env (по умолчанию 30 с). Запрос ВСЕГДА ограничен
+                       из .env (по умолчанию 60 с). Запрос ВСЕГДА ограничен
                        таймаутом: «зависнуть» на недоступной сети программа
                        не должна.
 
@@ -2115,6 +2266,8 @@ def generate_gigachat(
     try:
         text = ""
         if use_stream:
+            # Явный запрос стриминга. Оставлен для сетей без SSL-инспекции,
+            # но по умолчанию этот путь не задействован.
             try:
                 text = _generate_gigachat_streaming(
                     client, system_prompt, str(prompt), temperature, max_tokens
@@ -2126,11 +2279,11 @@ def generate_gigachat(
                     "переключаюсь на обычный режим",
                     scrub_text(str(stream_error)),
                 )
-                text = _generate_gigachat_sync(
+                text = _generate_gigachat_sync_with_retry(
                     client, system_prompt, str(prompt), temperature, max_tokens
                 )
         else:
-            text = _generate_gigachat_sync(
+            text = _generate_gigachat_sync_with_retry(
                 client, system_prompt, str(prompt), temperature, max_tokens
             )
 

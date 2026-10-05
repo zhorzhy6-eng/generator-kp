@@ -345,9 +345,10 @@ copy config\settings.example.json settings.json
 GIGACHAT_CREDENTIALS=ваш_ключ_из_личного_кабинета
 GIGACHAT_SCOPE=GIGACHAT_API_PERS
 GIGACHAT_MODEL=GigaChat
-GIGACHAT_TIMEOUT=30
+GIGACHAT_TIMEOUT=60
 GIGACHAT_VERIFY_SSL_CERTS=true
 GIGACHAT_CA_BUNDLE_FILE=
+GIGACHAT_BASE_URL=https://gigachat.devices.sberbank.ru/api/v1
 ```
 
 Если ключа нет, программа **не падает**: она работает на шаблонах и показывает
@@ -360,10 +361,19 @@ GIGACHAT_CA_BUNDLE_FILE=
 | `GIGACHAT_CREDENTIALS` | Authorization Key (base64) | — |
 | `GIGACHAT_SCOPE` | `GIGACHAT_API_PERS` / `_B2B` / `_CORP` | `GIGACHAT_API_PERS` |
 | `GIGACHAT_MODEL` | Модель | `GigaChat` |
-| `GIGACHAT_TIMEOUT` | Таймаут запроса, сек | `30` |
+| `GIGACHAT_TIMEOUT` | Таймаут запроса, сек | `60` |
 | `GIGACHAT_VERIFY_SSL_CERTS` | Проверка SSL-сертификата | `true` |
 | `GIGACHAT_CA_BUNDLE_FILE` | Путь к корневому сертификату Минцифры | — |
-| `GIGACHAT_BASE_URL` | Свой адрес API (если нужен прокси) | — |
+| `GIGACHAT_BASE_URL` | Адрес API GigaChat | `https://gigachat.devices.sberbank.ru/api/v1` |
+
+> **Почему `GIGACHAT_BASE_URL` задан явно.**
+> С версии библиотеки `gigachat` 0.2.0 значением по умолчанию стал адрес
+> `https://api.giga.chat/v1`, а он доступен не из всех сетей: TCP-соединение
+> к нему не устанавливается, и запрос падает с `ConnectTimeout [WinError 10060]`
+> через ~21 секунду. Авторизация при этом проходит, потому что идёт на другой
+> хост, — из-за этого ошибка выглядит «странной»: прогрев работает, а генерация нет.
+> Классический адрес Сбера работает стабильно, поэтому он указан явно.
+> Пустая строка = взять адрес по умолчанию из кода (тоже адрес Сбера).
 
 ### ⚠️ Безопасность
 
@@ -522,7 +532,8 @@ traceback — разбирать проблему можно по логу, бе
 | Нет сертификата Минцифры | Плашка «⚠️ SSL-сертификат Минцифры не найден…» |
 | Ошибка SSL | Плашка «⚠️ SSL: не удалось проверить сертификат» |
 | Нет сети / сервер недоступен | Запись в логе, текст — шаблонный |
-| Таймаут запроса | Запрос прерывается по `GIGACHAT_TIMEOUT` (по умолчанию 30 сек) |
+| `ConnectTimeout [WinError 10060]` | Проверьте `GIGACHAT_BASE_URL` в `.env` (см. выше): адрес по умолчанию `api.giga.chat` доступен не из всех сетей |
+| Таймаут запроса | Запрос прерывается по `GIGACHAT_TIMEOUT` (по умолчанию 60 сек), затем один автоматический повтор |
 | Пустой или некачественный ответ | Ответ не проходит валидацию — берётся шаблон |
 
 В логе это выглядит так:

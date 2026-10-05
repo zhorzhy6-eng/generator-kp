@@ -36,6 +36,7 @@ from logger_config import setup_logger, SETTINGS_PATH, PROJECT_ROOT, LOG_FILE as
 
 # Единый провайдер LLM (GigaChat + Ollama)
 from llm_provider import (
+    DEFAULT_GIGACHAT_TIMEOUT,
     DEFAULT_SYSTEM_PROMPT,
     detect_ssl_interception,
     generate_gigachat,
@@ -105,8 +106,11 @@ logger.info("Корень проекта: %s", PROJECT_ROOT)
 # ============================================
 
 AI_TEMPERATURE = 0.85      # креативность
-AI_MAX_TOKENS = 280        # короче ответ — быстрее приходит
-AI_TIMEOUT = 30            # секунд, задаётся также в .env (GIGACHAT_TIMEOUT)
+AI_MAX_TOKENS = 150        # короче ответ — быстрее приходит (было 280)
+# Таймаут НЕ задаём здесь: единственный источник истины — llm_provider,
+# который читает GIGACHAT_TIMEOUT из .env (иначе берёт 60 с). Значение ниже
+# только для справки в логе/интерфейсе, чтобы не было двух правд.
+AI_TIMEOUT = int(DEFAULT_GIGACHAT_TIMEOUT)
 
 # Короткий системный промпт: меньше токенов на вход — быстрее ответ
 GIGACHAT_SYSTEM_PROMPT = (
