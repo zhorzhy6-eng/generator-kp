@@ -26,6 +26,7 @@ import os
 import ssl
 import sys
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -524,6 +525,97 @@ def _read_text_file(path: Path) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Поиск SSL-инспекции в хранилище Windows
+# ---------------------------------------------------------------------------
+# Поиск идёт через PowerShell и занимает секунды (особенно на «холодной»
+# машине с антивирусом). Поэтому результат кладётся в кэш, а сам поиск может
+# выполняться в фоновом потоке: интерфейс не должен ждать его при запуске.
+# Пустой результат тоже кэшируется — иначе каждая проверка заново запускала
+# бы PowerShell.
+
+_INTERCEPTION_CACHE: Dict[str, Any] = {"names": None, "suspects": None, "running": False}
+_INTERCEPTION_LOCK = threading.Lock()
+
+
+def _scan_interception_engine() -> None:
+    """Один раз читает хранилище Windows и заполняет кэш SSL-инспекции."""
+    try:
+        names = _scan_windows_root_names()
+    except Exception:
+        names = []
+    try:
+        suspects = [subject for subject, _thumb in _interceptor_candidates(names)]
+    except Exception:
+        suspects = []
+
+    with _INTERCEPTION_LOCK:
+        _INTERCEPTION_CACHE["names"] = names
+        _INTERCEPTION_CACHE["suspects"] = suspects
+        _INTERCEPTION_CACHE["running"] = False
+
+    if suspects:
+        logger.info(
+            "SSL: в корневых сертификатах Windows найдена SSL-инспекция: %s",
+            "; ".join(suspects),
+        )
+
+
+def start_interception_scan() -> None:
+    """
+    Запускает поиск SSL-инспекции в фоне (один раз за запуск программы).
+
+    Вызывается при старте интерфейса: если поиск ещё не делали, он уйдёт
+    в отдельный поток и не задержит открытие окна. Результат появится
+    в кэше и будет использован диагностикой.
+    """
+    with _INTERCEPTION_LOCK:
+        if _INTERCEPTION_CACHE["names"] is not None or _INTERCEPTION_CACHE["running"]:
+            return
+        _INTERCEPTION_CACHE["running"] = True
+
+    try:
+        threading.Thread(
+            target=_scan_interception_engine, name="ssl-interception-scan", daemon=True
+        ).start()
+    except Exception:
+        with _INTERCEPTION_LOCK:
+            _INTERCEPTION_CACHE["running"] = False
+
+
+def _ensure_interception_scan() -> None:
+    """Доводит поиск SSL-инспекции до конца синхронно, если он ещё не сделан."""
+    with _INTERCEPTION_LOCK:
+        if _INTERCEPTION_CACHE["names"] is not None:
+            return
+    _scan_interception_engine()
+
+
+def windows_root_names() -> List[Tuple[str, str]]:
+    """Корневые сертификаты Windows [(Subject, отпечаток)] с кэшированием."""
+    _ensure_interception_scan()
+    with _INTERCEPTION_LOCK:
+        return list(_INTERCEPTION_CACHE["names"] or [])
+
+
+def detect_ssl_interception() -> List[str]:
+    """
+    Ищет в корневых сертификатах Windows признаки SSL-инспекции.
+
+    Возвращает список Subject-ов найденных «подменяющих» корней (например,
+    «CN=Kaspersky Anti-Virus Personal Root Certificate, O=AO Kaspersky Lab»).
+    Пустой список означает, что признаков нет — либо поиск ещё не завершён:
+    его можно запустить заранее функцией start_interception_scan(), тогда
+    проверка не задерживает интерфейс.
+
+    Это подсказка для диагностики: антивирус может стоять и без
+    SSL-инспекции, а корпоративный прокси — не иметь своего корня в системе.
+    """
+    if _INTERCEPTION_CACHE["suspects"] is None:
+        start_interception_scan()  # не ждём: поиск идёт в фоне
+    return list(_INTERCEPTION_CACHE["suspects"] or [])
+
+
 def _scan_windows_root_names() -> List[Tuple[str, str]]:
     """
     Быстро читает корневые сертификаты Windows: [(Subject, отпечаток)].
@@ -614,20 +706,6 @@ def _interceptor_candidates(names: List[Tuple[str, str]]) -> List[Tuple[str, str
         if len(result) >= _MAX_INTERCEPTOR_ROOTS:
             break
     return result
-
-
-def detect_ssl_interception() -> List[str]:
-    """
-    Ищет в корневых сертификатах Windows признаки SSL-инспекции.
-
-    Возвращает список Subject-ов найденных «подменяющих» корней (например,
-    «CN=Kaspersky Anti-Virus Personal Root Certificate, O=AO Kaspersky Lab»).
-    Пустой список означает, что признаков нет.
-
-    Это подсказка для диагностики: антивирус может стоять и без
-    SSL-инспекции, а корпоративный прокси — не иметь своего корня в системе.
-    """
-    return [subject for subject, _thumb in _interceptor_candidates(_scan_windows_root_names())]
 
 
 def _export_windows_roots_to_pem(
@@ -774,7 +852,7 @@ def _interceptor_pem_files(exclude: Optional[Path] = None) -> List[Tuple[Path, s
     if cached:
         return [(path, subject) for path, subject in cached if path != exclude]
 
-    names = _scan_windows_root_names()
+    names = windows_root_names()
     candidates = _interceptor_candidates(names)
     if not candidates:
         return []
@@ -1075,20 +1153,20 @@ def get_ca_bundle_status() -> Dict[str, Any]:
         except Exception:
             merged_count = 0
 
-    # Скан хранилища Windows идёт через PowerShell: ~0.3 с. Вызываем один раз
-    # и из результата достаём и признаки SSL-инспекции, и признак того, что
-    # проверка вообще состоялась (иначе «ничего не найдено» и «не смогли
-    # посмотреть» выглядели бы в диагностике одинаково).
-    store_names = _scan_windows_root_names()
+    # Признаки SSL-инспекции берём из кэша. Если фоновый поиск ещё идёт,
+    # кэш пуст — это не ошибка: диагностика покажет результат следующего
+    # открытия. Запускать PowerShell прямо здесь нельзя: окно диагностики
+    # должно открываться мгновенно.
+    with _INTERCEPTION_LOCK:
+        cached_names = _INTERCEPTION_CACHE["names"]
+        interception = list(_INTERCEPTION_CACHE["suspects"] or [])
+
     if os.name != "nt":
         store_scan = "skipped"
-    elif store_names:
+    elif isinstance(cached_names, list) and cached_names:
         store_scan = "found"
     else:
         store_scan = "empty"
-    interception = [
-        subject for subject, _thumb in _interceptor_candidates(store_names)
-    ]
 
     return {
         "found": str(found) if found else None,
@@ -2194,8 +2272,19 @@ def generate_text(
     return None
 
 
-def get_status_info() -> Dict[str, Any]:
-    """Краткая сводка о состоянии провайдеров — для логов и UI."""
+def get_status_info(include_ollama: bool = False) -> Dict[str, Any]:
+    """
+    Краткая сводка о состоянии провайдеров — для логов и UI.
+
+    Args:
+        include_ollama: проверять ли локальный сервер Ollama. По умолчанию
+            НЕТ, потому что проверка — это сетевой запрос к localhost:11434,
+            который при незапущенном Ollama ждёт таймаут (до 2 секунд, а на
+            Windows с антивирусом заметно дольше). Функция вызывается при
+            построении интерфейса, поэтому по умолчанию она работает только
+            с файлами и переменными окружения. Версия с GigaChat данные
+            Ollama не использует, а диагностика запрашивает их явно.
+    """
     try:
         model = os.environ.get("GIGACHAT_MODEL", DEFAULT_GIGACHAT_MODEL)
     except Exception:
@@ -2205,12 +2294,16 @@ def get_status_info() -> Dict[str, Any]:
     found_ca = find_ca_bundle()
     env_file = ENV_FILE or find_env_file()
 
+    ollama_available = is_ollama_available() if include_ollama else False
+    ollama_models = get_ollama_models() if include_ollama else []
+
     return {
         "gigachat_configured": is_gigachat_configured(),
         "gigachat_model": model,
         "gigachat_credentials": mask_credentials(get_gigachat_credentials()),
-        "ollama_available": is_ollama_available(),
-        "ollama_models": get_ollama_models(),
+        "ollama_available": ollama_available,
+        "ollama_models": ollama_models,
+        "ollama_checked": include_ollama,
         "env_path": str(env_file) if env_file else str(get_env_write_path()),
         "env_exists": bool(env_file and env_file.exists()),
         "env_found_paths": [str(p) for p in _env_search_paths()],
@@ -2226,11 +2319,22 @@ def get_status_info() -> Dict[str, Any]:
 # САМОПРОВЕРКА
 # ============================================
 
-# Сертификат Минцифры подхватывается сразу при импорте: так к моменту
-# первого запроса GIGACHAT_CA_BUNDLE_FILE уже заполнен.
+# ВАЖНО: при импорте модуля НИЧЕГО не собирается и не сканируется.
+# Раньше здесь вызывался setup_ca_bundle(), который читал хранилище
+# сертификатов Windows через PowerShell — на машине с антивирусом это
+# занимало десятки секунд, и всё это время окно программы не открывалось
+# (импорт идёт в том же потоке, что и построение интерфейса).
+#
+# Теперь набор сертификатов собирается лениво: при создании клиента
+# GigaChat (_get_gigachat_client), то есть в фоновом потоке при прогреве
+# или генерации. Если сертификат Минцифры уже есть, при старте он просто
+# попадает в GIGACHAT_CA_BUNDLE_FILE — это мгновенная проверка файла.
+
 try:
-    setup_ca_bundle()
-except Exception:  # pragma: no cover — диагностика не должна мешать работе
+    _startup_ca = find_ca_bundle()
+    if _startup_ca is not None:
+        os.environ.setdefault("GIGACHAT_CA_BUNDLE_FILE", str(_startup_ca))
+except Exception:  # pragma: no cover — поиск не должен мешать запуску
     pass
 
 

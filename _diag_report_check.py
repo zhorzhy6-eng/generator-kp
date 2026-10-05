@@ -69,10 +69,24 @@ for const in ("END", "LEFT", "RIGHT", "TOP", "BOTTOM", "BOTH", "X", "Y", "W", "E
     setattr(tk.constants, const, const)
 sys.modules["tkinter.constants"] = tk.constants
 for sub in ("ttk", "messagebox", "filedialog", "scrolledtext", "font"):
-    sys.modules[f"tkinter.{sub}"] = _PermissiveModule(f"tkinter.{sub}")
+    fake = _PermissiveModule(f"tkinter.{sub}")
+    sys.modules[f"tkinter.{sub}"] = fake
+    setattr(tk, sub, fake)  # чтобы tk.ttk.Notebook тоже работал
 sys.modules["tkinter"] = tk
 
+import time  # noqa: E402
+
+_t0 = time.time()
+print("[тайминг] до импорта GUI: %.2f s" % (time.time() - _t0))
 import генератор_кп_gigachat as gui  # noqa: E402
+
+print("[тайминг] модуль импортирован: %.2f s" % (time.time() - _t0))
+_t1 = time.time()
+status = gui.get_status_info()
+print("[тайминг] get_status_info(): %.2f s" % (time.time() - _t1))
+_t1 = time.time()
+gui.is_gigachat_configured()
+print("[тайминг] is_gigachat_configured(): %.2f s" % (time.time() - _t1))
 
 print("=" * 72)
 print("ОТЧЁТ «📋 ДИАГНОСТИКА» (как его увидит пользователь)")

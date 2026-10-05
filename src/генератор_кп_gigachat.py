@@ -47,6 +47,7 @@ from llm_provider import (
     is_gigachat_configured,
     sanitize_key,
     save_gigachat_key,
+    start_interception_scan,
     warmup_gigachat,
 )
 
@@ -1236,6 +1237,25 @@ def _build_diagnostics_report() -> str:
     except Exception:
         ca_ok = False
 
+    # ---------- Локальный Ollama ----------
+    # Проверяем его только здесь: это сетевой запрос с таймаутом, и при
+    # незапущенном Ollama он ждёт несколько секунд. Диагностика и без того
+    # идёт в фоновом потоке, а вот при построении окна такая проверка
+    # задерживала бы запуск программы.
+    try:
+        ollama = get_status_info(include_ollama=True)
+        if ollama.get("ollama_available"):
+            models = ", ".join(ollama.get("ollama_models") or []) or "—"
+            lines.append(f"✅ Ollama (локальный ИИ): доступен, модели: {models}")
+        else:
+            lines.append(
+                "ℹ️ Ollama (локальный ИИ): не запущен — для версии с GigaChat это нормально"
+            )
+        lines.append("")
+    except Exception as exc:
+        lines.append(f"ℹ️ Ollama: проверить не удалось ({exc})")
+        lines.append("")
+
     if not GIGACHAT_READY:
         lines.append("📊 Итог: программа запустится, но ИИ выключен —")
         lines.append("         ключ GigaChat не задан. Нажмите «🔑 Ключ».")
@@ -1815,6 +1835,14 @@ def _startup_ssl_check() -> None:
     раз, чтобы в лог не попадало одно и то же предупреждение дважды.
     Ошибки проверки не должны мешать запуску окна.
     """
+    try:
+        # Поиск SSL-инспекции идёт в фоне: он запускает PowerShell и на
+        # «холодной» машине занимает секунды. Ждать его при старте нельзя —
+        # окно должно открываться сразу, а результат появится в диагностике.
+        start_interception_scan()
+    except Exception as exc:  # pragma: no cover
+        logger.debug("Фоновый поиск SSL-инспекции не запустился: %s", exc)
+
     try:
         cert_ok = _certificate_present()
 
