@@ -21,12 +21,13 @@
   * Есть отдельная функция warmup() для прогрева авторизации в фоне
 """
 
+import hashlib
 import os
 import sys
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================
 # ЗАГРУЗКА .env (безопасно, если dotenv не установлен)
@@ -171,21 +172,115 @@ except Exception:  # pragma: no cover — битый .env не должен ро
 CA_BUNDLE_FILENAME = "russian_trusted_root_ca.cer"
 CA_BUNDLE_URL = "https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer"
 
+# Имя файла-склейки, который программа собирает сама (см. build_ca_bundle).
+MERGED_CA_BUNDLE_FILENAME = "ca_bundle_merged.pem"
+
+
+def _config_dirs() -> List[Path]:
+    """
+    Папки config\\, где может лежать сертификат Минцифры, по приоритету.
+
+    Порядок: рядом с .exe (сборка onedir) → корень проекта (запуск из
+    исходников) → текущая папка. Дубликаты убираются.
+    """
+    dirs: List[Path] = []
+
+    if IS_FROZEN:
+        try:
+            dirs.append(Path(sys.executable).resolve().parent / "config")
+        except Exception:
+            pass
+
+    dirs.append(PROJECT_ROOT / "config")
+
+    try:
+        dirs.append(Path(os.getcwd()) / "config")
+    except Exception:
+        pass
+
+    unique: List[Path] = []
+    for directory in dirs:
+        if directory not in unique:
+            unique.append(directory)
+    return unique
+
+
+def _ca_bundle_search_paths() -> List[Path]:
+    """
+    ВСЕ места, где программа ищет сертификат Минцифры, в порядке приоритета.
+
+    Раньше проверялась только папка config\\ — и пользователь, который
+    положил сертификат просто в корень проекта (или рядом с .exe), видел
+    «сертификат не найден», хотя файл лежал на виду. Теперь проверяются
+    все разумные места, а диагностика показывает полный список.
+    """
+    paths: List[Path] = []
+
+    def add(path: Optional[Path]) -> None:
+        """Добавляет путь без дубликатов."""
+        if path is None:
+            return
+        try:
+            resolved = Path(path)
+        except Exception:
+            return
+        if resolved not in paths:
+            paths.append(resolved)
+
+    # 1. Все папки config\: и ca.cer, и готовая склейка внутри них
+    for directory in _config_dirs():
+        add(directory / CA_BUNDLE_FILENAME)
+        add(directory / MERGED_CA_BUNDLE_FILENAME)
+
+    # 2. Прямо рядом с .exe (сборка onedir: .exe лежит в корне папки сборки)
+    if IS_FROZEN:
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            add(exe_dir / CA_BUNDLE_FILENAME)
+            add(exe_dir / MERGED_CA_BUNDLE_FILENAME)
+        except Exception:
+            pass
+
+    # 3. Корень проекта — «просто положил файл в папку проекта»
+    add(PROJECT_ROOT / CA_BUNDLE_FILENAME)
+    add(PROJECT_ROOT / MERGED_CA_BUNDLE_FILENAME)
+
+    # 4. Текущая рабочая папка (программу запустили из другого места)
+    try:
+        add(Path(os.getcwd()) / CA_BUNDLE_FILENAME)
+        add(Path(os.getcwd()) / MERGED_CA_BUNDLE_FILENAME)
+    except Exception:
+        pass
+
+    # 5. Домашняя папка — последний запасной вариант
+    try:
+        home = Path.home()
+        add(home / ".config" / "gigachat" / CA_BUNDLE_FILENAME)
+        add(home / CA_BUNDLE_FILENAME)
+    except Exception:
+        pass
+
+    return paths
+
 
 def _ca_bundle_dirs() -> List[Path]:
-    """Папки, где программа ищет корневой сертификат Минцифры."""
-    dirs: List[Path] = []
-    if IS_FROZEN:
-        dirs.append(Path(sys.executable).resolve().parent / "config")
-    dirs.append(PROJECT_ROOT / "config")
-    dirs.append(Path(os.getcwd()) / "config")
-    return dirs
+    """
+    Папки, где программа ищет корневой сертификат Минцифры.
+
+    Оставлена для совместимости (ею пользуются get_ssl_help и тесты);
+    фактический поиск идёт по полному списку _ca_bundle_search_paths().
+    """
+    return _config_dirs()
 
 
 def find_ca_bundle() -> Optional[Path]:
-    """Возвращает путь к найденному сертификату Минцифры или None."""
-    for directory in _ca_bundle_dirs():
-        candidate = directory / CA_BUNDLE_FILENAME
+    """
+    Возвращает путь к найденному сертификату Минцифры или None.
+
+    Проверяются все места из _ca_bundle_search_paths() — включая корень
+    проекта и папку рядом с .exe, а не только config\\.
+    """
+    for candidate in _ca_bundle_search_paths():
         try:
             if candidate.is_file():
                 return candidate
@@ -194,52 +289,676 @@ def find_ca_bundle() -> Optional[Path]:
     return None
 
 
-def setup_ca_bundle(logger_: Optional[Any] = None) -> Optional[str]:
+def get_ca_bundle_problem() -> Optional[str]:
     """
-    Подставляет сертификат Минцифры в GIGACHAT_CA_BUNDLE_FILE, если он найден.
+    Возвращает понятный текст проблемы с сертификатом или None.
 
-    Явно заданное в .env значение НЕ переопределяется — у пользователя
-    может быть свой сертификат (в том числе корпоративный).
+    Нужна для диагностики: если файл лежит, но пустой или слишком мал,
+    формально он «найден», а на деле не работает. Лучше сказать об этом
+    сразу, чем показывать «✅ найден» и потом ловить SSL-ошибку.
+    """
+    explicit = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+    if explicit and not os.path.isfile(explicit):
+        return f"путь из .env (GIGACHAT_CA_BUNDLE_FILE) не существует: {explicit}"
+
+    found = find_ca_bundle()
+    if found is None:
+        return None  # «не найден» — это отдельный сценарий, см. get_ca_bundle_status
+
+    try:
+        size = found.stat().st_size
+    except OSError as exc:
+        return f"не удалось прочитать файл сертификата: {exc}"
+
+    if size < 256:
+        return f"файл сертификата подозрительно мал ({size} байт): {found}"
+
+    try:
+        text = read_env_text(found)
+    except Exception as exc:
+        return f"файл сертификата не читается: {exc}"
+
+    if "BEGIN CERTIFICATE" not in text:
+        return f"в файле нет сертификата (ожидался PEM/Base64): {found}"
+
+    return None
+
+
+def _cert_common_name(der: bytes) -> str:
+    """
+    Возвращает Common Name сертификата (для диагностики) или пустую строку.
+
+    Используется библиотека cryptography (она и так стоит вместе с gigachat).
+    Если её нет — функция молча возвращает пустую строку: диагностика не
+    должна ломаться из-за отсутствия необязательной зависимости.
+    """
+    try:
+        from cryptography import x509  # type: ignore
+
+        cert = x509.load_der_x509_certificate(der)
+        for attribute in cert.subject:
+            if attribute.oid._name in ("commonName", "CN"):
+                return str(attribute.value)
+    except Exception:
+        return ""
+    return ""
+
+
+def _extra_ca_files() -> List[Path]:
+    """
+    Дополнительные сертификаты из папок config\\ — все *.cer/*.crt/*.pem.
+
+    Зачем: если ключ задан явно (GIGACHAT_CA_BUNDLE_FILE) или у пользователя
+    лежит ещё и корень антивируса, они нужны В ОДНОЙ склейке — цепочка
+    может требовать сразу оба.
+    """
+    files: List[Path] = []
+    for directory in _config_dirs():
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            if entry.suffix.lower() not in (".cer", ".crt", ".pem"):
+                continue
+            if entry.name == MERGED_CA_BUNDLE_FILENAME:
+                continue  # это наша же склейка, второй раз не нужна
+            if entry not in files:
+                files.append(entry)
+    return files
+
+
+def _certifi_bundle() -> Optional[Path]:
+    """
+    Путь к штатному набору корневых сертификатов (cacert.pem от certifi).
+
+    Нужен потому, что httpx (а значит и GigaChat) по умолчанию проверяет
+    именно этот файл. Стоит задать свой — и все «обычные» сайты перестанут
+    проверяться, поэтому склейка обязана включать и certifi тоже.
+    """
+    try:
+        import certifi  # type: ignore
+
+        path = Path(certifi.where())
+        if path.is_file():
+            return path
+    except Exception:
+        pass
+    return None
+
+
+def _is_path_inside(path: Path, directory: Path) -> bool:
+    """True, если path лежит внутри directory (без исключений наружу)."""
+    try:
+        path.resolve().relative_to(directory.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _copy_windows_cert_to_pem(cert_id: str, pem_text: str) -> Optional[Path]:
+    """
+    Кладёт PEM-текст сертификата в стабильный файл во временной папке.
+
+    Имя файла включает отпечаток, поэтому файл создаётся один раз и потом
+    просто переиспользуется. Возвращает путь или None.
+    """
+    import tempfile
+
+    safe = re.sub(r"[^0-9A-Fa-f]", "", cert_id)[:40] or hashlib.sha1(
+        pem_text.encode("utf-8")
+    ).hexdigest()[:16]
+    target = Path(tempfile.gettempdir()) / f"gigachat_extra_root_{safe.upper()}.pem"
+    try:
+        if target.is_file() and target.read_text(encoding="utf-8", errors="ignore") == pem_text:
+            return target
+        target.write_text(pem_text, encoding="utf-8")
+        return target
+    except Exception:
+        return None
+
+
+# Корневые сертификаты, по которым видно, что трафик проверяется «на лету»
+# (SSL-инспекция антивируса или прокси), и цепочка подменяется.
+#
+# ВАЖНО: сертификаты этих корней нужно положить в общую склейку, иначе
+# проверка TLS не пройдёт даже с сертификатом Минцифры — подменённую
+# цепочку подписывает именно корень антивируса.
+#
+# В списке только те имена, которые НЕ встречаются у обычных публичных
+# центров сертификации: Symantec, Comodo, DigiCert и прочие выдают
+# сертификаты сайтам, и добавлять их в склейку нельзя — это раздувает файл
+# и создаёт ложную тревогу в диагностике.
+_INTERCEPTOR_MARKERS = (
+    "kaspersky",
+    "avast",
+    "avg ",
+    "eset",
+    "dr.web",
+    "drweb",
+    "pro32",
+    "bitdefender",
+    "mcafee",
+    "norton",
+    "zscaler",
+    "fortinet",
+    "sophos",
+    "trend micro",
+    "outpost",
+    "cardinal",
+    "антивирус",
+    "лаборатория касперского",
+)
+
+# Сколько корней SSL-инспекции максимум кладём в склейку. Одного хватает
+# почти всегда, но у антивируса их может быть несколько (у Kaspersky —
+# отдельные корни для «Антивируса», «Веб-Антивируса» и т.п.).
+_MAX_INTERCEPTOR_ROOTS = 30
+
+
+def _is_interceptor_name(subject: str) -> bool:
+    """True, если Subject сертификата похож на корень антивируса/прокси."""
+    lowered = subject.lower()
+    return any(marker in lowered for marker in _INTERCEPTOR_MARKERS)
+
+
+def _run_powershell_to_file(script: str, out_file: Path, timeout: float = 40.0) -> bool:
+    """
+    Запускает PowerShell-скрипт, который пишет результат в файл.
+
+    Почему через файл, а не через stdout: вывод процесса читается либо
+    напрямую, либо через канал, а канал в ограниченных окружениях бывает
+    недоступен (тогда процесс молча возвращает пустоту). Файл работает
+    всегда и, кроме того, не зависит от кодировки консоли: результат
+    читается как UTF-8, поэтому кириллица в Subject сертификата не ломается.
 
     Returns:
-        Путь к используемому сертификату или None.
+        True, если PowerShell запустился и создал файл с данными.
+    """
+    try:
+        out_file.unlink()
+    except OSError:
+        pass
+
+    try:
+        import subprocess
+
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        logger.debug("PowerShell недоступен: %s", "запуск не удался", exc_info=True)
+        return False
+
+    if completed.returncode != 0:
+        logger.debug(
+            "PowerShell завершился с кодом %s: %s",
+            completed.returncode,
+            (completed.stderr or b"").decode("utf-8", errors="replace")[:400],
+        )
+    return out_file.is_file()
+
+
+def _read_text_file(path: Path) -> str:
+    """Читает текстовый файл в UTF-8 с запасными кодировками."""
+    try:
+        return read_env_text(path)
+    except Exception:
+        return ""
+
+
+def _scan_windows_root_names() -> List[Tuple[str, str]]:
+    """
+    Быстро читает корневые сертификаты Windows: [(Subject, отпечаток)].
+
+    На типичной машине это ~600 сертификатов и меньше секунды работы.
+    Хранилище открывается через .NET (X509Store), а не через диск Cert:\\:
+    диск доступен не во всех окружениях, а .NET-класс работает всегда.
+
+    Windows-хранилище читается только как ПОДСКАЗКА: сам Python (OpenSSL)
+    его не использует, поэтому корня, установленного в системе (например,
+    сертификата Минцифры или корня антивируса), программе может не хватать —
+    его приходится добавлять в склейку вручную.
+
+    Если хранилище недоступно (не Windows, запрет политики), возвращается
+    пустой список: программа продолжает работать как раньше.
+    """
+    if os.name != "nt":  # pragma: no cover — только Windows
+        return []
+
+    import tempfile
+
+    # Разделитель "|" и перевод строки вместо TAB: значение Subject не может
+    # содержать перевод строки, а кириллица спокойно живёт в UTF-8.
+    out_file = Path(tempfile.gettempdir()) / "gigachat_windows_roots.txt"
+    quoted = str(out_file).replace("'", "''")
+
+    script = (
+        "Add-Type -AssemblyName System.Security;"
+        "function Get-RootItems($name) {"
+        "  try {"
+        "    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, 'LocalMachine');"
+        "    $store.Open('ReadOnly');"
+        "    $items = @($store.Certificates);"
+        "    $store.Close();"
+        "    return $items"
+        "  } catch { return @() }"
+        "};"
+        "$all = @();"
+        "$all += Get-RootItems 'Root';"
+        "$all += Get-RootItems 'AuthRoot';"
+        "$lines = foreach ($c in $all) {"
+        "  $s = $c.Subject.Replace([char]13, ' ').Replace([char]10, ' ').Trim();"
+        "  $c.Thumbprint.ToUpper() + '|' + $s"
+        "};"
+        f"$lines -join ([char]10) | Out-File -FilePath '{quoted}' -Encoding utf8"
+    )
+
+    if not _run_powershell_to_file(script, out_file):
+        logger.debug("Список корневых сертификатов Windows получить не удалось")
+        return []
+
+    result: List[Tuple[str, str]] = []
+    seen = set()
+
+    for line in _read_text_file(out_file).splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        thumbprint, subject = line.split("|", 1)
+        thumbprint = thumbprint.strip().upper()
+        if not re.fullmatch(r"[0-9A-F]{40}", thumbprint):
+            continue
+        if thumbprint in seen:
+            continue
+        seen.add(thumbprint)
+        result.append((subject.strip(), thumbprint))
+
+    return result
+
+
+def _interceptor_candidates(names: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """
+    Отбирает из списка корней те, что похожи на SSL-инспекцию.
+
+    Возвращает [(Subject, отпечаток)] без повторов по Subject. Если
+    антивирус держит несколько своих корней, попадут все (до
+    _MAX_INTERCEPTOR_ROOTS) — иначе подменённая цепочка не проверится.
+    """
+    result: List[Tuple[str, str]] = []
+    seen_subjects = set()
+    for subject, thumbprint in names:
+        if not _is_interceptor_name(subject):
+            continue
+        if subject in seen_subjects:
+            continue
+        seen_subjects.add(subject)
+        result.append((subject, thumbprint))
+        if len(result) >= _MAX_INTERCEPTOR_ROOTS:
+            break
+    return result
+
+
+def detect_ssl_interception() -> List[str]:
+    """
+    Ищет в корневых сертификатах Windows признаки SSL-инспекции.
+
+    Возвращает список Subject-ов найденных «подменяющих» корней (например,
+    «CN=Kaspersky Anti-Virus Personal Root Certificate, O=AO Kaspersky Lab»).
+    Пустой список означает, что признаков нет.
+
+    Это подсказка для диагностики: антивирус может стоять и без
+    SSL-инспекции, а корпоративный прокси — не иметь своего корня в системе.
+    """
+    return [subject for subject, _thumb in _interceptor_candidates(_scan_windows_root_names())]
+
+
+def _export_windows_roots_to_pem(
+    thumbprints: List[str], out_dir: Path
+) -> List[Tuple[Path, str]]:
+    """
+    Выгружает указанные сертификаты из хранилища Windows в PEM-файлы.
+
+    Отпечатки передаются в PowerShell списком, поэтому на диск попадают
+    ровно нужные сертификаты (обычно 1–3), а не все шестьсот.
+    Проверка «issuer = subject» отсекает промежуточные сертификаты: в
+    склейку нужны только корни.
+
+    Returns:
+        [(путь к PEM-файлу, Subject)] только для успешно выгруженных.
+    """
+    if not thumbprints:
+        return []
+
+    wanted = sorted({t.strip().upper() for t in thumbprints if t.strip()})
+    if not wanted:
+        return []
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+
+    out_file = out_dir / "_export.tsv"
+    quoted = str(out_file).replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Security;"
+        f"$wanted = @({','.join(repr(t) for t in wanted)});"
+        "function Get-RootItems($name) {"
+        "  try {"
+        "    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($name, 'LocalMachine');"
+        "    $store.Open('ReadOnly');"
+        "    $items = @($store.Certificates);"
+        "    $store.Close();"
+        "    return $items"
+        "  } catch { return @() }"
+        "};"
+        "$all = @();"
+        "$all += Get-RootItems 'Root';"
+        "$all += Get-RootItems 'AuthRoot';"
+        "$lines = foreach ($c in $all) {"
+        "  if (-not ($wanted -contains $c.Thumbprint.ToUpper())) { continue }"
+        "  $der = $c.RawData;"
+        "  $b64 = [Convert]::ToBase64String($der, 'InsertLineBreaks');"
+        "  $pem = \"-----BEGIN CERTIFICATE-----\" + [Environment]::NewLine + $b64 + "
+        "[Environment]::NewLine + \"-----END CERTIFICATE-----\";"
+        "  $s = $c.Subject.Replace([char]13, ' ').Replace([char]10, ' ').Trim();"
+        "  $i = $c.Issuer.Replace([char]13, ' ').Replace([char]10, ' ').Trim();"
+        "  $esc = $pem.Replace([char]13, '').Replace([char]10, '\\n');"
+        "  $c.Thumbprint.ToUpper() + '|' + $s.Replace('|', '/') + '|' + $i.Replace('|', '/') + '|' + $esc"
+        "};"
+        f"$lines -join ([char]10) | Out-File -FilePath '{quoted}' -Encoding utf8"
+    )
+
+    if not _run_powershell_to_file(script, out_file, timeout=45.0):
+        return []
+
+    result: List[Tuple[Path, str]] = []
+    for line in _read_text_file(out_file).splitlines():
+        line = line.strip()
+        if not line or line.count("|") < 3:
+            continue
+        thumbprint, subject, issuer, pem_flat = line.split("|", 3)
+        thumbprint = thumbprint.strip().upper()
+        if not re.fullmatch(r"[0-9A-F]{40}", thumbprint):
+            continue
+        if subject.strip() != issuer.strip():
+            continue  # это не корень (сам себе не подписан) — в склейку не берём
+
+        pem = pem_flat.replace("\\n", "\n").strip() + "\n"
+        if "BEGIN CERTIFICATE" not in pem:
+            continue
+
+        # Сверяем отпечаток: файл должен быть тем самым сертификатом.
+        try:
+            der = ssl.PEM_cert_to_DER_cert(pem)
+        except Exception:
+            continue
+        if hashlib.sha1(der).hexdigest().upper() != thumbprint:
+            continue
+
+        pem_path = out_dir / f"{thumbprint.lower()}.pem"
+        try:
+            pem_path.write_text(pem, encoding="utf-8")
+        except Exception:
+            continue
+        result.append((pem_path, subject.strip()))
+
+    if not result:
+        logger.debug(
+            "Ни один корень SSL-инспекции не выгружен из хранилища Windows "
+            "(отпечатков запрошено: %s)",
+            len(wanted),
+        )
+    return result
+
+
+def _interceptor_pem_files(exclude: Optional[Path] = None) -> List[Tuple[Path, str]]:
+    """
+    PEM-файлы корней SSL-инспекции из хранилища Windows (для склейки).
+
+    Именно эти сертификаты подписывают подменённую цепочку, поэтому без них
+    проверка TLS не пройдёт даже с сертификатом Минцифры.
+    """
+    names = _scan_windows_root_names()
+    candidates = _interceptor_candidates(names)
+    if not candidates:
+        return []
+
+    import tempfile
+
+    out_dir = Path(tempfile.gettempdir()) / "gigachat_roots"
+    exported = _export_windows_roots_to_pem([t for _s, t in candidates], out_dir)
+
+    return [(path, subject) for path, subject in exported if path != exclude]
+
+
+def _locate_av_root_pem(exclude: Optional[Path] = None) -> Optional[Tuple[Path, str]]:
+    """
+    Возвращает первый корень SSL-инспекции (путь к PEM, Subject) или None.
+
+    Совместимая обёртка над _interceptor_pem_files().
+    """
+    found = _interceptor_pem_files(exclude)
+    return found[0] if found else None
+
+
+def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
+    """
+    Собирает ОДИН файл-склейку из всех нужных корневых сертификатов.
+
+    Зачем склейка, а не один файл. Параметр verify у httpx принимает либо
+    набор системных корней (certifi), либо ОДИН файл. Как только программа
+    подставляет сертификат Минцифры, certifi перестаёт использоваться — и
+    любая цепочка, которой нужен обычный корень (или корень антивируса при
+    SSL-инспекции), начинает падать. Поэтому в склейку попадают:
+
+      1. корень Минцифры (без него GigaChat не проверяется вообще);
+      2. дополнительно — все *.cer/*.crt/*.pem из config\\ (корень
+         антивируса, корпоративный корень и т.п.);
+      3. штатный cacert.pem от certifi — чтобы не потерять обычные корни;
+      4. корень SSL-инспекции из хранилища Windows, если он там есть, —
+         именно он подписывает подменённую цепочку.
+
+    Сертификаты сравниваются по SHA-1 отпечатку, дубликаты не попадают.
+    Файл перезаписывается только при изменении содержимого: лишних
+    обращений к диску нет.
+
+    Returns:
+        Путь к склейке или None, если ни одного сертификата не нашлось.
+    """
+    log = logger_ or logger
+
+    config_dir = PROJECT_ROOT / "config"
+    if IS_FROZEN:
+        try:
+            config_dir = Path(sys.executable).resolve().parent / "config"
+        except Exception:
+            pass
+    target = config_dir / MERGED_CA_BUNDLE_FILENAME
+
+    # Куда писать, если config\ недоступна (например, программа лежит в
+    # защищённой папке): временная папка. Работает, хотя и менее заметно.
+    if not _is_path_inside(target, PROJECT_ROOT) and not IS_FROZEN:
+        fallback_dir = Path(os.environ.get("TEMP") or os.getcwd())
+        target = fallback_dir / MERGED_CA_BUNDLE_FILENAME
+
+    candidates: List[Path] = []
+
+    def add(path: Optional[Path]) -> None:
+        if path is None:
+            return
+        try:
+            if path.is_file() and path not in candidates:
+                candidates.append(path)
+        except OSError:
+            return
+
+    # GIGACHAT_CA_BUNDLE_FILE мог быть задан явно — в склейке он первый
+    explicit = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+    if explicit:
+        add(Path(explicit))
+
+    add(find_ca_bundle())
+    for extra in _extra_ca_files():
+        add(extra)
+    add(_certifi_bundle())
+
+    av_roots = _interceptor_pem_files(exclude=target)
+    for av_path, av_subject in av_roots:
+        log.info("SSL: корень SSL-инспекции (антивирус/прокси) добавлен в склейку: %s", av_subject)
+        add(av_path)
+
+    if not candidates:
+        return None
+
+    # Собираем блоки сертификатов по одному, сохраняя порядок источников:
+    # Минцифры → свои сертификаты из config\ → корень антивируса → certifi.
+    # Дубликаты отсекаются по SHA-1 отпечатку.
+    merged_blocks: List[str] = []
+    merged_thumbs = set()
+    for path in candidates:
+        try:
+            raw = path.read_bytes()
+        except Exception:
+            continue
+
+        blocks = re.findall(
+            r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            raw.decode("utf-8", errors="ignore"),
+            re.DOTALL,
+        )
+        if not blocks and raw[:1] == b"\x30":
+            try:
+                blocks = [ssl.DER_cert_to_PEM_cert(raw).strip()]
+            except Exception:
+                blocks = []
+
+        for block in blocks:
+            try:
+                der = ssl.PEM_cert_to_DER_cert(block)
+            except Exception:
+                continue
+            thumb = hashlib.sha1(der).hexdigest()
+            if thumb in merged_thumbs:
+                continue
+            merged_thumbs.add(thumb)
+            merged_blocks.append(block.strip())
+
+    if not merged_blocks:
+        return None
+
+    header = (
+        "# Автоматически собранный набор корневых сертификатов «Генератора КП».\n"
+        "# Файл создаётся программой при запуске, править его вручную не нужно.\n"
+        f"# Корней в наборе: {len(merged_blocks)}. Источники: config\\, certifi, "
+        "хранилище Windows.\n"
+    )
+    content = header + "\n".join(merged_blocks) + "\n"
+
+    try:
+        if target.is_file() and target.read_text(encoding="utf-8", errors="ignore") == content:
+            return target  # ничего не изменилось — файл не трогаем
+    except Exception:
+        pass
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        log.info(
+            "SSL: сертификаты объединены в один файл (%s корней): %s",
+            len(merged_blocks),
+            target,
+        )
+        return target
+    except Exception as exc:
+        log.warning("SSL: не удалось записать объединённый сертификат %s: %s", target, exc)
+
+    # Последняя попытка — во временной папке
+    try:
+        import tempfile
+
+        tmp_target = Path(tempfile.mkdtemp(prefix="gigachat_ca_")) / MERGED_CA_BUNDLE_FILENAME
+        tmp_target.write_text(content, encoding="utf-8")
+        log.info("SSL: склейка сертификатов записана во временную папку: %s", tmp_target)
+        return tmp_target
+    except Exception:
+        return None
+
+
+def setup_ca_bundle(logger_: Optional[Any] = None) -> Optional[str]:
+    """
+    Подставляет сертификаты в GIGACHAT_CA_BUNDLE_FILE, если они найдены.
+
+    Логика:
+      * значение, заданное в .env, НЕ переопределяется — путь пользователя
+        всегда в приоритете (но и он проходит через склейку, чтобы не
+        потерять остальные корни);
+      * иначе собирается склейка (см. build_ca_bundle) и её путь попадает
+        в GIGACHAT_CA_BUNDLE_FILE.
+
+    Returns:
+        Путь к используемому набору сертификатов или None.
     """
     log = logger_ or logger
 
     explicit = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+    if explicit and explicit != "none" and os.path.isfile(explicit):
+        log.info("CA-сертификат задан явно в .env: %s", explicit)
+
+    problem = get_ca_bundle_problem()
+    if problem:
+        log.warning("SSL: %s", problem)
+
+    merged = build_ca_bundle(log)
+    if merged is not None:
+        os.environ["GIGACHAT_CA_BUNDLE_FILE"] = str(merged)
+        return str(merged)
+
     if explicit:
-        if os.path.isfile(explicit):
-            log.info("CA-сертификат задан явно в .env: %s", explicit)
-            return explicit
-        log.warning(
-            "GIGACHAT_CA_BUNDLE_FILE указывает на несуществующий файл: %s",
-            explicit,
-        )
+        log.warning("GIGACHAT_CA_BUNDLE_FILE указывает на несуществующий файл: %s", explicit)
         return None
 
-    found = find_ca_bundle()
-    if found:
-        os.environ["GIGACHAT_CA_BUNDLE_FILE"] = str(found)
-        log.info("CA-сертификат Минцифры найден и подключён: %s", found)
-        return str(found)
-
+    search_paths = _ca_bundle_search_paths()
     log.info(
-        "CA-сертификат Минцифры не найден (ожидался в %s)",
-        PROJECT_ROOT / "config" / CA_BUNDLE_FILENAME,
+        "CA-сертификат Минцифры не найден — искали в %s местах (первое: %s)",
+        len(search_paths),
+        search_paths[0],
     )
     return None
 
 
 def get_ca_bundle_status() -> Dict[str, Any]:
     """
-    Полный статус сертификата Минцифры — для диагностики в интерфейсе и логе.
+    Полный статус сертификатов — для диагностики в интерфейсе и логе.
 
     Returns:
-        found:          путь к подключённому сертификату или None;
+        found:          путь к найденному сертификату Минцифры или None;
         expected:       путь, где сертификат ищут в первую очередь;
         search_paths:   все места поиска (в порядке приоритета);
+        searched_count: сколько мест проверено;
         explicit:       путь, заданный вручную в GIGACHAT_CA_BUNDLE_FILE;
         explicit_valid: существует ли файл, заданный вручную;
+        problem:        текст проблемы (пустой/битый файл), если она есть;
+        merged_bundle:  путь к собранной склейке сертификатов (или None);
+        merged_count:   сколько корней в склейке;
+        interception:   Subject-ы корней антивируса из хранилища Windows;
         verify_ssl:     включена ли проверка сертификата;
         url:            официальный адрес загрузки сертификата.
     """
@@ -247,24 +966,39 @@ def get_ca_bundle_status() -> Dict[str, Any]:
     explicit = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
     explicit_valid = bool(explicit) and os.path.isfile(explicit)
 
-    # Список путей без повторов: в исходниках PROJECT_ROOT и cwd — одна и та
-    # же папка, и дубли только запутывают диагностику.
-    search_paths: List[str] = []
-    for directory in _ca_bundle_dirs():
-        candidate = str(directory / CA_BUNDLE_FILENAME)
-        if candidate not in search_paths:
-            search_paths.append(candidate)
+    search_paths = [str(path) for path in _ca_bundle_search_paths()]
+
+    # Склейку собираем только при необходимости: чтение хранилища Windows
+    # идёт через PowerShell и занимает время — в диагностике это заметно.
+    merged = explicit if explicit_valid else None
+    merged_count = 0
+    if merged:
+        try:
+            merged_count = len(
+                re.findall(
+                    r"-----BEGIN CERTIFICATE-----",
+                    read_env_text(Path(merged)),
+                )
+            )
+        except Exception:
+            merged_count = 0
 
     return {
         "found": str(found) if found else None,
-        "expected": str(_ca_bundle_dirs()[0] / CA_BUNDLE_FILENAME),
+        "expected": str(_ca_bundle_search_paths()[0]),
         "search_paths": search_paths,
+        "searched_count": len(search_paths),
         "explicit": explicit or None,
         "explicit_valid": explicit_valid,
+        "problem": get_ca_bundle_problem(),
+        "merged_bundle": merged,
+        "merged_count": merged_count,
+        "interception": detect_ssl_interception(),
         "verify_ssl": os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "true").strip().lower()
         != "false",
         "url": CA_BUNDLE_URL,
     }
+
 
 
 def log_ssl_error_context(error: Any, logger_: Optional[Any] = None) -> None:
