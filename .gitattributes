@@ -6,6 +6,10 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
+# Хуки git — это sh-скрипты. Если Windows-версия git переведёт их в CRLF,
+# они перестанут запускаться (ошибка «bad interpreter»).
+scripts/pre-commit text eol=lf
+
 *.png binary
 *.jpg binary
 *.jpeg binary

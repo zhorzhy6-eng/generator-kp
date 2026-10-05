@@ -1,0 +1,66 @@
+#!/bin/sh
+# ============================================================
+#  pre-commit hook: защита от утечки секретов в Git
+# ============================================================
+#  Проект коммитится автоматически (scripts/sync-to-github.ps1),
+#  поэтому проверка нужна ДО коммита, а не после.
+#
+#  Блокирует коммит, если в индексе (staged) есть:
+#    * файлы с секретами и пользовательскими данными;
+#    * строка с непустым GIGACHAT_CREDENTIALS внутри любого файла.
+#
+#  Установка: файл должен лежать в .git/hooks/pre-commit без расширения.
+#  Обход (осознанный): git commit --no-verify
+# ============================================================
+
+FORBIDDEN_FILES=".env .env.local settings.json settings.user.backup.json"
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$STAGED" ] && exit 0
+
+FAIL=0
+
+# ---------- 1. Запрещённые имена файлов ----------
+for f in $FORBIDDEN_FILES; do
+    if echo "$STAGED" | grep -qE "(^|/)$(echo "$f" | sed 's/\./\\./g')$"; then
+        echo "❌ ЗАПРЕЩЕНО коммитить: $f"
+        FAIL=1
+    fi
+done
+
+# ---------- 2. Расширения с секретами и логами ----------
+BAD_EXT=$(echo "$STAGED" | grep -E "\.(key|pem|pfx|p12|log)$" || true)
+if [ -n "$BAD_EXT" ]; then
+    echo "❌ ЗАПРЕЩЕНО коммитить файлы с секретами/логами:"
+    echo "$BAD_EXT" | sed 's/^/   /'
+    FAIL=1
+fi
+
+# ---------- 3. Непустой ключ GigaChat внутри staged-файлов ----------
+# Ищем только добавленные строки: это быстрее и не ловит историю.
+SECRET_HITS=$(git diff --cached -U0 | grep -E "^\+" | grep -vE "^\+\+\+" \
+    | grep -E "GIGACHAT_CREDENTIALS[[:space:]]*=[[:space:]]*[A-Za-z0-9+/=_-]{20,}" || true)
+if [ -n "$SECRET_HITS" ]; then
+    echo "❌ В staged найден непустой GIGACHAT_CREDENTIALS (ключ GigaChat)."
+    echo "   Значение скрыто намеренно. Уберите ключ из файла и повторите коммит."
+    FAIL=1
+fi
+
+# ---------- 4. Явные признаки других секретов ----------
+OTHER_HITS=$(git diff --cached -U0 | grep -E "^\+" | grep -vE "^\+\+\+" \
+    | grep -E "(api[_-]?key|secret|password|token)[[:space:]]*[=:][[:space:]]*['\"]?[A-Za-z0-9+/=_-]{24,}" \
+    | grep -viE "your_|placeholder|example|changeme|xxx|<.*>" || true)
+if [ -n "$OTHER_HITS" ]; then
+    echo "⚠️  В staged найдены строки, похожие на секреты (проверьте вручную):"
+    echo "$OTHER_HITS" | cut -c1-100 | sed 's/^/   /'
+    FAIL=1
+fi
+
+if [ "$FAIL" -ne 0 ]; then
+    echo ""
+    echo "🚫 Коммит отменён. Секреты и логи не должны попадать в репозиторий."
+    echo "   Если это ложное срабатывание: git commit --no-verify"
+    exit 1
+fi
+
+exit 0
