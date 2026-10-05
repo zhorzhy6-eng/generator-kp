@@ -22,6 +22,7 @@
 """
 
 import os
+import sys
 import re
 import time
 from pathlib import Path
@@ -30,18 +31,228 @@ from typing import Any, Dict, List, Optional
 # ============================================
 # ЗАГРУЗКА .env (безопасно, если dotenv не установлен)
 # ============================================
-# .env ищем в корне проекта относительно этого файла (<корень>/src/llm_provider.py)
+# Файл .env ищется в нескольких местах, потому что программа запускается
+# по-разному: из исходников, из .bat и из собранного .exe. Внутри .exe
+# переменная __file__ указывает во временную папку распаковки PyInstaller —
+# искать .env там бессмысленно, поэтому рядом с .exe (sys.executable) файл
+# проверяется отдельно и раньше всего.
 
+IS_FROZEN = bool(getattr(sys, "frozen", False))
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def _env_search_paths() -> List[Path]:
+    """
+    Возвращает список мест, где может лежать .env, в порядке приоритета.
+
+    Приоритет важен: пользователь, который положил .env рядом с .exe,
+    ожидает, что именно этот файл и будет использован.
+    """
+    candidates: List[Path] = []
+
+    if IS_FROZEN:
+        # 1. Рядом с .exe — основной вариант для собранной программы
+        candidates.append(Path(sys.executable).resolve().parent / ".env")
+    else:
+        # 1. Корень проекта — основной вариант для запуска из исходников
+        candidates.append(PROJECT_ROOT / ".env")
+
+    # 2. Текущая рабочая директория (запуск из другой папки)
+    try:
+        candidates.append(Path(os.getcwd()) / ".env")
+    except Exception:
+        pass
+
+    # 3. Вверх от .exe (если .exe лежит в подпапке dist\)
+    if IS_FROZEN:
+        try:
+            candidates.append(Path(sys.executable).resolve().parent.parent / ".env")
+        except Exception:
+            pass
+
+    # Убираем дубликаты, сохраняя порядок
+    unique: List[Path] = []
+    for path in candidates:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def find_env_file() -> Optional[Path]:
+    """Возвращает первый существующий .env или None."""
+    for path in _env_search_paths():
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def get_env_write_path() -> Path:
+    """
+    Возвращает путь, КУДА сохранять .env (например, ключ из интерфейса).
+
+    Для .exe это всегда папка рядом с .exe — то есть папка, доступная на
+    запись. Внутри архива PyInstaller писать нельзя, поэтому сохранение
+    «рядом с исходником» сломало бы ввод ключа.
+    """
+    if IS_FROZEN:
+        return Path(sys.executable).resolve().parent / ".env"
+    return PROJECT_ROOT / ".env"
+
+
+def read_env_text(path: Path) -> str:
+    """
+    Читает .env, устойчиво к BOM и «неправильным» кодировкам.
+
+    Файл мог быть создан Блокнотом (UTF-8 с BOM), bat-скриптом (CP866)
+    или PowerShell-ом. Раньше BOM ломал имя первой переменной, и ключ
+    молча не подхватывался — программа сообщала «ключ не задан».
+    """
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1251", "cp866"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    # Последний шанс: декодируем с заменой, лишь бы не падать
+    return raw.decode("utf-8", errors="replace")
+
+
+ENV_FILE: Optional[Path] = None
 
 try:
     from dotenv import load_dotenv
 
-    # override=False: реальные переменные окружения имеют приоритет над .env
-    load_dotenv(ENV_PATH, override=False)
+    ENV_FILE = find_env_file()
+    if ENV_FILE is not None:
+        # override=False: реальные переменные окружения имеют приоритет над .env.
+        # Строку разбираем сами — так BOM и кодировка больше не мешают.
+        load_dotenv(ENV_FILE, override=False, encoding="utf-8-sig")
+        # Страховка для файлов в CP866/CP1251: dotenv их не прочитает
+        try:
+            for line in read_env_text(ENV_FILE).splitlines():
+                line = line.strip().lstrip("\ufeff")
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key and key not in os.environ:
+                    os.environ[key] = value.strip().strip('"').strip("'")
+        except Exception:
+            pass
 except ImportError:  # pragma: no cover — python-dotenv не установлен
     pass
+except Exception:  # pragma: no cover — битый .env не должен ронять запуск
+    ENV_FILE = None
+
+# ============================================
+# SSL: КОРНЕВОЙ СЕРТИФИКАТ МИНЦИФРЫ
+# ============================================
+# GigaChat отвечает по HTTPS, а корпоративный прокси или антивирус часто
+# подменяет сертификат своим. Тогда любая проверка TLS падает с
+# CERTIFICATE_VERIFY_FAILED. Правильное лечение — добавить доверенный
+# корневой сертификат, а НЕ отключать проверку (verify_ssl=false).
+#
+# Сертификат кладётся в config/russian_trusted_root_ca.cer и подхватывается
+# автоматически. Скачивать его за пользователя программа не станет:
+# подмена источника сертификата — это ровно та атака, от которой он защищает.
+
+CA_BUNDLE_FILENAME = "russian_trusted_root_ca.cer"
+CA_BUNDLE_URL = "https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer"
+
+
+def _ca_bundle_dirs() -> List[Path]:
+    """Папки, где программа ищет корневой сертификат Минцифры."""
+    dirs: List[Path] = []
+    if IS_FROZEN:
+        dirs.append(Path(sys.executable).resolve().parent / "config")
+    dirs.append(PROJECT_ROOT / "config")
+    dirs.append(Path(os.getcwd()) / "config")
+    return dirs
+
+
+def find_ca_bundle() -> Optional[Path]:
+    """Возвращает путь к найденному сертификату Минцифры или None."""
+    for directory in _ca_bundle_dirs():
+        candidate = directory / CA_BUNDLE_FILENAME
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def setup_ca_bundle(logger_: Optional[Any] = None) -> Optional[str]:
+    """
+    Подставляет сертификат Минцифры в GIGACHAT_CA_BUNDLE_FILE, если он найден.
+
+    Явно заданное в .env значение НЕ переопределяется — у пользователя
+    может быть свой сертификат (в том числе корпоративный).
+
+    Returns:
+        Путь к используемому сертификату или None.
+    """
+    log = logger_ or logger
+
+    explicit = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+    if explicit:
+        if os.path.isfile(explicit):
+            log.info("CA-сертификат задан явно в .env: %s", explicit)
+            return explicit
+        log.warning(
+            "GIGACHAT_CA_BUNDLE_FILE указывает на несуществующий файл: %s",
+            explicit,
+        )
+        return None
+
+    found = find_ca_bundle()
+    if found:
+        os.environ["GIGACHAT_CA_BUNDLE_FILE"] = str(found)
+        log.info("CA-сертификат Минцифры найден и подключён: %s", found)
+        return str(found)
+
+    log.info(
+        "CA-сертификат Минцифры не найден (ожидался в %s)",
+        PROJECT_ROOT / "config" / CA_BUNDLE_FILENAME,
+    )
+    return None
+
+
+def get_ssl_help() -> str:
+    """
+    Инструкция по исправлению SSL-ошибки — показывается в GUI и в логе.
+
+    Возвращает готовый текст, чтобы интерфейс и лог не расходились.
+    """
+    ca_path = _ca_bundle_dirs()[0] / CA_BUNDLE_FILENAME
+    return (
+        "⚠️ SSL-ошибка при обращении к GigaChat.\n\n"
+        "Возможные причины:\n"
+        "1. Корпоративный прокси или антивирус подменяет сертификаты\n"
+        "2. Не установлен корневой сертификат Минцифры\n\n"
+        "Решение:\n"
+        "1. Скачайте сертификат:\n"
+        f"   {CA_BUNDLE_URL}\n"
+        "2. Положите его в папку config рядом с программой:\n"
+        f"   {ca_path}\n"
+        "3. Либо пропишите свой путь в .env:\n"
+        "   GIGACHAT_CA_BUNDLE_FILE=C:\\certs\\russian_trusted_root_ca.cer\n"
+        "4. Перезапустите программу\n\n"
+        "Отключать GIGACHAT_VERIFY_SSL_CERTS не нужно: это убирает защиту\n"
+        "от подмены трафика, а проблему не решает."
+    )
+
+
+def log_ssl_help(logger_: Optional[Any] = None) -> None:
+    """Пишет инструкцию по SSL в лог (без ключей и токенов)."""
+    log = logger_ or logger
+    for line in get_ssl_help().splitlines():
+        log.warning("%s", line)
+
 
 # ============================================
 # ЛОГГЕР
@@ -268,17 +479,28 @@ def _get_gigachat_client() -> Optional[Any]:
     verify_ssl = (
         os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "true").strip().lower() != "false"
     )
+
+    # Сертификат Минцифры подхватывается автоматически: без него в сетях с
+    # корпоративной подменой TLS любой запрос падает с CERTIFICATE_VERIFY_FAILED.
+    setup_ca_bundle()
     ca_bundle = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip() or None
 
+    base_url = (os.environ.get("GIGACHAT_BASE_URL") or "").strip() or None
+
+    client_kwargs: Dict[str, Any] = {
+        "credentials": credentials,
+        "scope": scope,
+        "model": model,
+        "timeout": timeout,
+        "verify_ssl_certs": verify_ssl,
+        "ca_bundle_file": ca_bundle,
+    }
+    if base_url:
+        # Позволяет работать через прокси, если прямой доступ закрыт
+        client_kwargs["base_url"] = base_url
+
     try:
-        _gigachat_client = GigaChat(
-            credentials=credentials,
-            scope=scope,
-            model=model,
-            timeout=timeout,
-            verify_ssl_certs=verify_ssl,
-            ca_bundle_file=ca_bundle,
-        )
+        _gigachat_client = GigaChat(**client_kwargs)
         _gigachat_config_key = config_key
 
         # ВАЖНО: сам ключ не логируем — только маску
@@ -315,11 +537,74 @@ def warmup_gigachat() -> bool:
     try:
         start = time.time()
         client.get_token()
+        clear_ssl_error()
         logger.info("Прогрев GigaChat выполнен за %.2f сек", time.time() - start)
         return True
     except Exception as e:
+        if is_ssl_error(e):
+            note_ssl_error(e)
         logger.warning("Прогрев GigaChat не удался: %s", scrub_text(str(e)))
         return False
+
+
+# ============================================
+# SSL: ОБНАРУЖЕНИЕ ПРОБЛЕМЫ
+# ============================================
+# Последняя SSL-ошибка хранится, чтобы интерфейс мог показать красную
+# плашку «см. README», а не молча уходить в шаблонный текст.
+
+_last_ssl_error: Optional[str] = None
+_ssl_help_logged = False
+
+
+def is_ssl_error(error: Any) -> bool:
+    """
+    Определяет, что ошибка связана с проверкой TLS-сертификата.
+
+    Проверяем и тип, и текст: разные версии httpx/ssl приносят это
+    то как ConnectError, то как SSLError, то как ошибку внутри цепочки.
+    """
+    text = scrub_text(str(error)).lower()
+    markers = (
+        "certificate_verify_failed",
+        "certificate verify failed",
+        "self-signed certificate",
+        "self signed certificate",
+        "ssl: ",
+        "sslerror",
+        "unknown ca",
+    )
+    if any(marker in text for marker in markers):
+        return True
+    return type(error).__name__ in {"SSLError", "SSLCertVerificationError"}
+
+
+def note_ssl_error(error: Any) -> None:
+    """Запоминает SSL-ошибку и один раз печатает инструкцию в лог."""
+    global _last_ssl_error, _ssl_help_logged
+
+    _last_ssl_error = scrub_text(str(error))
+
+    if not _ssl_help_logged:
+        _ssl_help_logged = True
+        logger.error("Обнаружена SSL-ошибка при обращении к GigaChat")
+        log_ssl_help()
+
+
+def get_last_ssl_error() -> Optional[str]:
+    """Текст последней SSL-ошибки или None, если её не было."""
+    return _last_ssl_error
+
+
+def has_ssl_error() -> bool:
+    """Была ли в этом запуске SSL-ошибка (для статуса в интерфейсе)."""
+    return _last_ssl_error is not None
+
+
+def clear_ssl_error() -> None:
+    """Сбрасывает отметку SSL-ошибки (после успешного запроса)."""
+    global _last_ssl_error
+    _last_ssl_error = None
 
 
 # ============================================
@@ -497,6 +782,11 @@ def generate_gigachat(
         if error_name in _AUTH_ERROR_NAMES or "401" in scrub_text(str(e)):
             logger.info("Сбрасываю клиент GigaChat после ошибки авторизации")
             reset_gigachat_client()
+
+        # SSL — отдельная причина: дело не в ключе и не в сети, а в проверке
+        # сертификата. Запоминаем, чтобы интерфейс показал плашку «см. README».
+        if is_ssl_error(e):
+            note_ssl_error(e)
 
         return None
 
@@ -714,20 +1004,38 @@ def get_status_info() -> Dict[str, Any]:
     except Exception:
         model = DEFAULT_GIGACHAT_MODEL
 
+    ca_bundle = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+    found_ca = find_ca_bundle()
+    env_file = ENV_FILE or find_env_file()
+
     return {
         "gigachat_configured": is_gigachat_configured(),
         "gigachat_model": model,
         "gigachat_credentials": mask_credentials(get_gigachat_credentials()),
         "ollama_available": is_ollama_available(),
         "ollama_models": get_ollama_models(),
-        "env_path": str(ENV_PATH),
-        "env_exists": ENV_PATH.exists(),
+        "env_path": str(env_file) if env_file else str(get_env_write_path()),
+        "env_exists": bool(env_file and env_file.exists()),
+        "env_found_paths": [str(p) for p in _env_search_paths()],
+        "ca_bundle": ca_bundle,
+        "ca_bundle_found": str(found_ca) if found_ca else None,
+        "ca_bundle_expected": str(_ca_bundle_dirs()[0] / CA_BUNDLE_FILENAME),
+        "ssl_error": has_ssl_error(),
+        "frozen": IS_FROZEN,
     }
 
 
 # ============================================
 # САМОПРОВЕРКА
 # ============================================
+
+# Сертификат Минцифры подхватывается сразу при импорте: так к моменту
+# первого запроса GIGACHAT_CA_BUNDLE_FILE уже заполнен.
+try:
+    setup_ca_bundle()
+except Exception:  # pragma: no cover — диагностика не должна мешать работе
+    pass
+
 
 if __name__ == "__main__":
     # Консоль Windows часто в cp1251 — переключаем вывод в UTF-8,
@@ -745,6 +1053,7 @@ if __name__ == "__main__":
     logger.info("=" * 70)
 
     info = get_status_info()
+    print(f"Запуск из EXE:        {'да' if info['frozen'] else 'нет (исходники)'}")
     print(f"Файл .env:            {info['env_path']} (существует: {info['env_exists']})")
     print(f"GigaChat настроен:    {'✅ да' if info['gigachat_configured'] else '❌ нет'}")
     print(f"GigaChat credentials: {info['gigachat_credentials']}")
@@ -752,3 +1061,12 @@ if __name__ == "__main__":
     print(f"Ollama доступен:      {'✅ да' if info['ollama_available'] else '❌ нет'}")
     print(f"Ollama модели:        {', '.join(info['ollama_models']) or '—'}")
     print(f"Активный провайдер:   {get_available_provider()}")
+    print()
+    print(f"Сертификат Минцифры:  {info['ca_bundle'] or '— не задан —'}")
+    print(f"  найден в проекте:   {info['ca_bundle_found'] or '❌ нет'}")
+    print(f"  ожидаемый путь:     {info['ca_bundle_expected']}")
+    print(f"SSL-ошибка в сессии:  {'⚠️ да' if info['ssl_error'] else 'нет'}")
+    print()
+    print("Искали .env в:")
+    for candidate in info["env_found_paths"]:
+        print(f"  - {candidate}")
