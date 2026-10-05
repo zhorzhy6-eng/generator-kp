@@ -403,19 +403,76 @@ def _is_path_inside(path: Path, directory: Path) -> bool:
         return False
 
 
+_WORK_DIR_CACHE: Dict[str, Optional[Path]] = {"path": None}
+
+
+def get_work_dir() -> Path:
+    """
+    Рабочая папка для служебных файлов программы (временные сертификаты и т.п.).
+
+    Почему не просто tempfile.gettempdir(): внутри собранного .exe системная
+    временная папка определяется не всегда — тогда Python подставляет
+    текущий каталог, и служебные файлы начинали сыпаться прямо в папку
+    программы. Выглядит это как мусор рядом с .exe, а на машине, где папка
+    доступна только для чтения, программа вообще не смогла бы собрать набор
+    сертификатов.
+
+    Порядок выбора:
+      1. системная временная папка (обычный случай);
+      2. подпапка runtime рядом с программой (если временная недоступна);
+      3. папка программы (последний вариант).
+    """
+    if _WORK_DIR_CACHE["path"] is not None:
+        return _WORK_DIR_CACHE["path"]
+
+    import tempfile
+
+    def usable(path: Path) -> bool:
+        """Папка пригодна, если в неё реально можно записать файл."""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return True
+        except Exception:
+            return False
+
+    candidates: List[Path] = []
+    try:
+        candidates.append(Path(tempfile.gettempdir()))
+    except Exception:
+        pass
+    try:
+        candidates.append(Path(tempfile.gettempdir()) / "GeneratorKP")
+    except Exception:
+        pass
+    try:
+        candidates.append(PROJECT_ROOT / "runtime")
+    except Exception:
+        pass
+    candidates.append(PROJECT_ROOT)
+
+    for candidate in candidates:
+        if usable(candidate):
+            _WORK_DIR_CACHE["path"] = candidate
+            return candidate
+
+    _WORK_DIR_CACHE["path"] = PROJECT_ROOT
+    return PROJECT_ROOT
+
+
 def _copy_windows_cert_to_pem(cert_id: str, pem_text: str) -> Optional[Path]:
     """
-    Кладёт PEM-текст сертификата в стабильный файл во временной папке.
+    Кладёт PEM-текст сертификата в стабильный файл в рабочей папке.
 
     Имя файла включает отпечаток, поэтому файл создаётся один раз и потом
     просто переиспользуется. Возвращает путь или None.
     """
-    import tempfile
-
     safe = re.sub(r"[^0-9A-Fa-f]", "", cert_id)[:40] or hashlib.sha1(
         pem_text.encode("utf-8")
     ).hexdigest()[:16]
-    target = Path(tempfile.gettempdir()) / f"gigachat_extra_root_{safe.upper()}.pem"
+    target = get_work_dir() / f"gigachat_extra_root_{safe.upper()}.pem"
     try:
         if target.is_file() and target.read_text(encoding="utf-8", errors="ignore") == pem_text:
             return target
@@ -635,11 +692,9 @@ def _scan_windows_root_names() -> List[Tuple[str, str]]:
     if os.name != "nt":  # pragma: no cover — только Windows
         return []
 
-    import tempfile
-
     # Разделитель "|" и перевод строки вместо TAB: значение Subject не может
     # содержать перевод строки, а кириллица спокойно живёт в UTF-8.
-    out_file = Path(tempfile.gettempdir()) / "gigachat_windows_roots.txt"
+    out_file = get_work_dir() / "gigachat_windows_roots.txt"
     quoted = str(out_file).replace("'", "''")
 
     script = (
