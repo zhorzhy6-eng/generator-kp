@@ -34,6 +34,7 @@ from logger_config import setup_logger, SETTINGS_PATH
 # Единый провайдер LLM (GigaChat + Ollama)
 from llm_provider import (
     DEFAULT_SYSTEM_PROMPT,
+    ENV_PATH as PROJECT_ROOT_ENV,
     generate_gigachat,
     get_status_info,
     is_gigachat_configured,
@@ -813,6 +814,184 @@ def show_gigachat_help():
 
 
 # ============================================
+# ВВОД КЛЮЧА ПРЯМО ИЗ ИНТЕРФЕЙСА
+# ============================================
+
+
+def _save_credentials_to_env(key: str) -> str:
+    """
+    Записывает ключ в .env, не затирая остальные настройки.
+
+    Файл создаётся при необходимости. Старая строка с ключом удаляется,
+    новая добавляется в конец. Возвращает путь к .env.
+    """
+    env_path = PROJECT_ROOT_ENV
+    lines = []
+
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = [
+                line.rstrip("\n")
+                for line in f
+                if not line.startswith("GIGACHAT_CREDENTIALS")
+            ]
+
+    if not lines:
+        lines = [
+            "GIGACHAT_SCOPE=GIGACHAT_API_PERS",
+            "GIGACHAT_MODEL=GigaChat",
+            "GIGACHAT_TIMEOUT=30",
+            "GIGACHAT_VERIFY_SSL_CERTS=true",
+            "GIGACHAT_CA_BUNDLE_FILE=",
+        ]
+
+    lines.append(f"GIGACHAT_CREDENTIALS={key}")
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return env_path
+
+
+def enter_api_key():
+    """
+    Диалог ввода API-ключа GigaChat.
+
+    Ключ сохраняется в .env (в .gitignore) и подхватывается без перезапуска.
+    Сам ключ никогда не логируется и не показывается на экране.
+    """
+    global GIGACHAT_READY, GIGACHAT_MODEL
+
+    dialog = tk.Toplevel(window)
+    dialog.title("Ввод API-ключа GigaChat")
+    dialog.configure(bg=BG_COLOR)
+    dialog.resizable(False, False)
+    dialog.transient(window)
+    dialog.grab_set()
+
+    tk.Label(
+        dialog,
+        text="🔑 API-ключ GigaChat",
+        font=("Arial", 12, "bold"),
+        bg=BG_COLOR,
+    ).pack(pady=(15, 5))
+
+    tk.Label(
+        dialog,
+        text=(
+            "Получите Authorization Key (base64):\n"
+            "developers.sber.ru → Личный кабинет → Настройки\n\n"
+            "Ключ сохранится в .env и НЕ попадёт в Git."
+        ),
+        font=("Arial", 9),
+        bg=BG_COLOR,
+        justify="center",
+    ).pack(padx=20, pady=5)
+
+    # show="*" — ключ не отображается на экране
+    key_entry = tk.Entry(dialog, width=55, font=("Arial", 9), show="*")
+    key_entry.pack(padx=20, pady=10)
+    key_entry.focus_set()
+
+    tk.Label(
+        dialog,
+        text="(символы скрыты — это нормально, вставка через Ctrl+V)",
+        font=("Arial", 8),
+        fg="#888",
+        bg=BG_COLOR,
+    ).pack()
+
+    def save():
+        global GIGACHAT_READY, GIGACHAT_MODEL
+
+        key = key_entry.get().strip()
+
+        if not key:
+            messagebox.showwarning("Внимание", "Ключ не введён.", parent=dialog)
+            return
+
+        try:
+            env_path = _save_credentials_to_env(key)
+        except Exception as e:
+            logger.error("Не удалось сохранить ключ в .env: %s", e)
+            messagebox.showerror(
+                "Ошибка", f"❌ Не удалось записать .env:\n{e}", parent=dialog
+            )
+            return
+
+        # Подхватываем новый ключ без перезапуска программы
+        os.environ["GIGACHAT_CREDENTIALS"] = key
+        try:
+            from llm_provider import reset_gigachat_client
+
+            reset_gigachat_client()
+        except Exception:
+            pass
+
+        GIGACHAT_READY = is_gigachat_configured()
+        GIGACHAT_MODEL = get_status_info().get("gigachat_model", "GigaChat")
+        AICache.clear()
+
+        dialog.destroy()
+
+        # Обновляем индикатор в шапке
+        try:
+            status_label.config(
+                text=f"GigaChat: ✅ GigaChat готов ({GIGACHAT_MODEL})",
+                fg="#4CAF50",
+            )
+        except NameError:
+            pass
+
+        logger.info("Ключ GigaChat сохранён в .env и активирован (значение не логируется)")
+
+        if messagebox.askyesno(
+            "Готово!",
+            f"✅ Ключ сохранён в:\n{env_path}\n\n"
+            "🔒 Убедитесь, что .env в .gitignore (он там по умолчанию).\n\n"
+            "Выполнить проверку подключения сейчас?",
+        ):
+            warmup_async()
+        else:
+            refresh_preview_async()
+
+    cancel_button = tk.Button(
+        dialog,
+        text="Отмена",
+        font=("Arial", 9),
+        bg="#9E9E9E",
+        fg="white",
+        padx=15,
+        pady=5,
+        cursor="hand2",
+        command=dialog.destroy,
+    )
+    cancel_button.pack(side="left", padx=20, pady=15)
+
+    save_button = tk.Button(
+        dialog,
+        text="💾 Сохранить",
+        font=("Arial", 9, "bold"),
+        bg="#4CAF50",
+        fg="white",
+        padx=15,
+        pady=5,
+        cursor="hand2",
+        command=save,
+    )
+    save_button.pack(side="right", padx=20, pady=15)
+
+    dialog.bind("<Return>", lambda event: save())
+    dialog.bind("<Escape>", lambda event: dialog.destroy())
+
+    # Центрируем диалог относительно главного окна
+    dialog.update_idletasks()
+    x = window.winfo_rootx() + (window.winfo_width() - dialog.winfo_width()) // 2
+    y = window.winfo_rooty() + (window.winfo_height() - dialog.winfo_height()) // 3
+    dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+
+# ============================================
 # ГРАФИЧЕСКИЙ ИНТЕРФЕЙС
 # ============================================
 
@@ -841,13 +1020,14 @@ else:
     status_text = "❌ Ключ не задан — используется шаблонный текст"
     status_color = "#f44336"
 
-tk.Label(
+status_label = tk.Label(
     header_frame,
     text=f"GigaChat: {status_text}",
     font=("Arial", 9),
     fg=status_color,
     bg=BG_COLOR,
-).pack()
+)
+status_label.pack()
 
 ai_control_frame = tk.Frame(window, bg=BG_COLOR)
 ai_control_frame.pack(pady=5)
@@ -879,6 +1059,18 @@ tk.Button(
     pady=3,
     cursor="hand2",
     command=warmup_async,
+).pack(side="left", padx=2)
+
+tk.Button(
+    ai_control_frame,
+    text="🔑 Ключ",
+    font=("Arial", 9),
+    bg="#3F51B5",
+    fg="white",
+    padx=8,
+    pady=3,
+    cursor="hand2",
+    command=enter_api_key,
 ).pack(side="left", padx=2)
 
 tk.Button(
