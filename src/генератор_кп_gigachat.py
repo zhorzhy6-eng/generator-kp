@@ -531,6 +531,11 @@ def generate_text_sync(region: str, cities: List[str], use_cache: bool = True) -
         if ai_text:
             if use_cache:
                 AICache.set(cache_key, ai_text)
+            # Парная запись к «🔄 Использован шаблонный текст» ниже.
+            # Без неё по логу нельзя было понять, что текст пришёл от ИИ:
+            # успешный путь не логировался вообще, и казалось, что программа
+            # всегда работает на шаблонах.
+            logger.info("✅ Использован ИИ-текст")
             if cities_text:
                 return f"{ai_text}\n\n{cities_text}"
             return ai_text
@@ -1173,7 +1178,14 @@ def _build_diagnostics_report() -> str:
         f"   scope: {os.environ.get('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')}"
     )
     lines.append(
-        f"   таймаут запроса: {os.environ.get('GIGACHAT_TIMEOUT', '30')} сек"
+        f"   таймаут запроса: "
+        f"{os.environ.get('GIGACHAT_TIMEOUT', int(DEFAULT_GIGACHAT_TIMEOUT))} сек"
+    )
+    # Адрес API показываем явно: именно неверный/недоступный адрес даёт
+    # ошибку [WinError 10060], и по отчёту это видно сразу.
+    lines.append(
+        f"   адрес API (base_url): "
+        f"{os.environ.get('GIGACHAT_BASE_URL') or 'по умолчанию (адрес Сбера)'}"
     )
     lines.append(f"   режим запуска: {'собранный EXE' if STATUS_INFO.get('frozen') else 'исходники'}")
     lines.append("")
