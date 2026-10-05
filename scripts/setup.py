@@ -280,14 +280,76 @@ def check_sources() -> bool:
 # ============================================
 
 
-def build(spec: Path, label: str) -> bool:
-    """Собирает EXE по spec-файлу."""
+def free_stale_output(exe_name: str) -> None:
+    """
+    Освобождает путь dist/<exe_name> перед сборкой.
+
+    PyInstaller дописывает данные в уже созданный .exe, поэтому существующий
+    файл нужно убрать. Иногда обычное удаление невозможно: файл держит
+    антивирус (Kaspersky и подобные сканируют свежесобранный .exe) или
+    остался «хвост» от прерванной сборки. Тогда файл ПЕРЕИМЕНОВЫВАЕТСЯ —
+    это отдельная операция, которая в такой ситуации проходит, после чего
+    имя снова свободно.
+
+    Никакие данные пользователя здесь не трогаются: только наш dist/.
+    """
+    target = DIST_DIR / exe_name
+    if not target.exists():
+        return
+
+    try:
+        target.unlink()
+        print(f"  ♻️  Удалён старый файл: {exe_name}")
+        return
+    except Exception as exc:
+        print(f"  ⚠️  Не удалось удалить {exe_name}: {exc}")
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    stale = target.with_name(f"{target.stem}_STALE_{stamp}{target.suffix}")
+    try:
+        target.rename(stale)
+        print(f"  ♻️  Файл был занят — отложен как {stale.name}")
+    except Exception as exc:
+        print(f"  ❌ Не удалось освободить {target}: {exc}")
+        print("     Закройте программу (если запущена) и повторите сборку.")
+
+
+def cleanup_old_stale() -> None:
+    """Убирает ранее отложенные файлы *_STALE_*, чтобы dist не разрастался."""
+    try:
+        for item in DIST_DIR.glob("*_STALE_*"):
+            try:
+                item.unlink()
+            except Exception:
+                # Занятый файл не мешает сборке — оставляем как есть
+                pass
+    except Exception:
+        pass
+
+
+def build(spec: Path, label: str, exe_name: str) -> bool:
+    """
+    Собирает EXE по spec-файлу.
+
+    PyInstaller выпускает файл с расширением .bin (см. комментарий в spec),
+    а итоговое имя .exe присваивается здесь, последним шагом. Это обходит
+    блокировку на запись, которую антивирус/защита Windows накладывает на
+    только что созданный .exe: PyInstaller пишет файл в несколько приёмов,
+    и последний приём (дописывание архива) иначе падает с PermissionError.
+    """
     print(f"\n  📦 {label}")
     print(f"     spec: {spec.name}")
 
     if not spec.is_file():
         print(f"     ❌ spec-файл не найден: {spec}")
         return False
+
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_old_stale()
+
+    bin_name = Path(exe_name).with_suffix(".bin").name
+    free_stale_output(bin_name)
+    free_stale_output(exe_name)
 
     # Вызываем PyInstaller как модуль: так не зависим от того, попал ли
     # pyinstaller.exe в PATH (частая проблема на Windows).
@@ -306,11 +368,27 @@ def build(spec: Path, label: str) -> bool:
         ]
     )
 
-    if code != 0:
+    produced = DIST_DIR / bin_name
+    if code != 0 or not produced.is_file():
         print(f"     ❌ Сборка не удалась (код {code})")
+        print("     Подсказка: если в ошибке PermissionError — файл блокирует")
+        print("     антивирус. Добавьте папку проекта в его исключения.")
+        free_stale_output(bin_name)
         return False
 
-    print(f"     ✅ Сборка завершена")
+    # Последний шаг: .bin -> .exe
+    final = DIST_DIR / exe_name
+    try:
+        if final.exists():
+            free_stale_output(exe_name)
+        produced.rename(final)
+    except Exception as exc:
+        print(f"     ⚠️  Собран файл {produced.name}, но переименовать не удалось: {exc}")
+        print(f"        Переименуйте вручную в {exe_name}")
+        return False
+
+    size_mb = final.stat().st_size / (1024 * 1024)
+    print(f"     ✅ Сборка завершена: {final.name} ({size_mb:.1f} МБ)")
     return True
 
 
@@ -485,11 +563,11 @@ def main() -> int:
     step(5, "Сборка EXE")
     built = []
 
-    if build(GIGACHAT_SPEC, "Версия с ИИ (GigaChat)"):
+    if build(GIGACHAT_SPEC, "Версия с ИИ (GigaChat)", GIGACHAT_EXE):
         built.append((GIGACHAT_EXE, GIGACHAT_EXE))
 
     if not args.skip_template:
-        if build(TEMPLATE_SPEC, "Шаблонная версия (без ИИ)"):
+        if build(TEMPLATE_SPEC, "Шаблонная версия (без ИИ)", TEMPLATE_EXE):
             built.append((TEMPLATE_EXE, DESKTOP_TEMPLATE_EXE))
 
     if not built:
