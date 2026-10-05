@@ -42,6 +42,9 @@ try {
         return $output.Trim()
     }
 
+    # Пульс: одна строка на каждый запуск, чтобы было видно, что задача жива
+    Write-Log "--- запуск проверки ---"
+
     # ---------- Проверяем, что это git-репозиторий ----------
     Invoke-Git @('rev-parse', '--is-inside-work-tree') | Out-Null
     if ($script:GitExitCode -ne 0) { Write-Log "ОШИБКА: $RepoPath не является git-репозиторием"; exit 1 }
