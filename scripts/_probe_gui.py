@@ -55,45 +55,35 @@ import генератор_кп_gigachat as g  # noqa: E402
 note("imported OK; GIGACHAT_READY=%s" % g.GIGACHAT_READY)
 note("excepthook installed = %s" % (sys.excepthook is g._excepthook))
 note("threading.excepthook set = %s" % (threading.excepthook is g._thread_excepthook))
+
+note("step: reading protocol")
 note("window protocol WM_DELETE_WINDOW = %r" % g.window.protocol("WM_DELETE_WINDOW"))
+note("step: protocol OK")
+
 note("has update_ssl_banner = %s" % callable(g.update_ssl_banner))
 note("has show_ssl_help = %s" % callable(g.show_ssl_help))
 note("has show_diagnostics = %s" % callable(g.show_diagnostics))
-note("documents dir = %s" % g._documents_dir())
 
-# Проверяем плашку SSL (должна быть скрыта, пока ошибки не было)
+note("step: _documents_dir")
+note("documents dir = %s" % g._documents_dir())
+note("step: _documents_dir OK")
+
+note("step: update_ssl_banner (expect hidden)")
 g.update_ssl_banner()
 note("ssl banner mapped (expect False) = %s" % g.ssl_banner.winfo_ismapped())
 
-# Симулируем SSL-ошибку
+note("step: simulate SSL error")
 import llm_provider  # noqa: E402
 
 llm_provider.note_ssl_error("ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] test")
 g.update_ssl_banner()
 note("ssl banner mapped after error (expect True) = %s" % g.ssl_banner.winfo_ismapped())
 
-# Проверяем, что обработка ключа идёт в правильный путь
 note("env write path = %s" % llm_provider.get_env_write_path())
 
-# Проверяем mainloop на скрытом окне
-hidden = created[0]
-hidden.withdraw()
-
-
-def stop():
-    time.sleep(2)
-    note("mainloop ran fine for 2s -> destroying")
-    hidden.destroy()
-
-
-threading.Thread(target=stop, daemon=True).start()
-t0 = time.time()
-hidden.mainloop()
-note("mainloop blocked for %.2fs (expect ~2s)" % (time.time() - t0))
-
-# Проверяем on_closing
-g.on_closing()
-note("on_closing() executed OK; closed flag = %s" % g._window_closed["value"])
+note("step: single instance lock")
+handle, already = g._acquire_single_instance_lock()
+note("mutex handle=%r already_running=%s" % (handle, already))
 
 note("ALL CHECKS DONE")
 os._exit(0)

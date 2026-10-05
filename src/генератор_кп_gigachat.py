@@ -1253,28 +1253,44 @@ def _acquire_single_instance_lock():
     Две одновременно запущенные копии писали в один лог-файл и мешали друг
     другу, а вторая копия могла упасть ещё до появления окна.
 
+    ВАЖНО: используем use_last_error=True и ctypes.get_last_error().
+    Обычный kernel32.GetLastError() здесь ненадёжен — Python успевает
+    сбросить код ошибки до того, как мы его прочитаем.
+
     Returns:
-        handle мьютекса или None, если программа уже запущена / не Windows.
+        (handle, already_running) — handle мьютекса (или None) и признак
+        того, что программа уже запущена.
     """
     if os.name != "nt":
-        return None
+        return None, False
+
     try:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [
+            wintypes.LPVOID,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
         kernel32.CreateMutexW.restype = wintypes.HANDLE
+
         handle = kernel32.CreateMutexW(None, True, "Global\\GeneratorKP_GigaChat")
+        last_error = ctypes.get_last_error()
+
         if not handle:
-            return None
-        # ERROR_ALREADY_EXISTS = 183
-        if kernel32.GetLastError() == 183:
-            kernel32.CloseHandle(handle)
-            return None
-        return handle
+            logger.debug("CreateMutexW не удался (код %s)", last_error)
+            return None, False
+
+        # ERROR_ALREADY_EXISTS = 183: мьютекс уже создан другой копией
+        if last_error == 183:
+            return handle, True
+
+        return handle, False
     except Exception as exc:
         logger.debug("Проверка единственного экземпляра недоступна: %s", exc)
-        return None
+        return None, False
 
 
 # ============================================
@@ -1683,9 +1699,12 @@ else:
 # ГЛАВНЫЙ ЦИКЛ
 # ============================================
 
-_mutex_handle = _acquire_single_instance_lock()
-if _mutex_handle is None and os.name == "nt":
-    logger.warning("Похоже, программа уже запущена — работаю вторым экземпляром")
+_mutex_handle, _already_running = _acquire_single_instance_lock()
+if _already_running:
+    # Не мешаем работать, но честно говорим в логе, что это вторая копия
+    logger.warning(
+        "Обнаружена уже запущенная копия программы — работаю вторым экземпляром"
+    )
 
 try:
     window.mainloop()
