@@ -71,6 +71,14 @@ def _env_search_paths() -> List[Path]:
         except Exception:
             pass
 
+    # 4. Домашняя папка пользователя — самый последний запасной вариант.
+    # Полезно, если программа запускается из нестандартного места, а ключ
+    # пользователь положил в профиль. Приоритет ниже всех остальных.
+    try:
+        candidates.append(Path.home() / ".env")
+    except Exception:
+        pass
+
     # Убираем дубликаты, сохраняя порядок
     unique: List[Path] = []
     for path in candidates:
@@ -543,6 +551,67 @@ def reset_gigachat_client() -> None:
     _gigachat_config_key = None
     _gigachat_client_timeout = None
     logger.info("Клиент GigaChat сброшен")
+
+
+def save_gigachat_key(key: str) -> Path:
+    """
+    Сохраняет ключ GigaChat в .env, который программа реально читает.
+
+    Пишет в ТОТ ЖЕ файл, который ищет find_env_file()/get_env_write_path():
+    для собранного EXE — рядом с .exe, для исходников — в корне проекта.
+    Так запись и чтение никогда не расходятся (раньше ключ мог сохраняться
+    в одном месте, а читаться из другого — и ввод «не работал»).
+
+    Остальные настройки .env не затираются: строка GIGACHAT_CREDENTIALS
+    заменяется или добавляется, недостающие ключи создаются. После записи
+    переменная окружения в текущем процессе обновляется, а кэш клиента
+    сбрасывается — новый ключ начинает действовать без перезапуска.
+
+    Args:
+        key: значение Authorization Key (сам ключ в лог не попадает).
+
+    Returns:
+        Path к записанному файлу .env.
+    """
+    env_path = get_env_write_path()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: List[str] = []
+    if env_path.exists():
+        try:
+            # read_env_text устойчива к BOM и кодировкам cp1251/cp866
+            lines = [
+                line.rstrip("\n")
+                for line in read_env_text(env_path).splitlines()
+                if not line.startswith("GIGACHAT_CREDENTIALS")
+            ]
+        except Exception:
+            lines = []
+
+    if not lines:
+        lines = [
+            "GIGACHAT_SCOPE=GIGACHAT_API_PERS",
+            "GIGACHAT_MODEL=GigaChat",
+            "GIGACHAT_TIMEOUT=30",
+            "GIGACHAT_VERIFY_SSL_CERTS=true",
+            "GIGACHAT_CA_BUNDLE_FILE=",
+        ]
+    elif not any(line.startswith("GIGACHAT_CA_BUNDLE_FILE") for line in lines):
+        # Сохраняем настройку SSL, даже если её не было в старом файле
+        lines.append("GIGACHAT_CA_BUNDLE_FILE=")
+
+    lines.append(f"GIGACHAT_CREDENTIALS={key}")
+
+    # encoding="utf-8" без BOM: так файл читают и dotenv, и сам генератор
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Подхватываем новый ключ без перезапуска программы
+    os.environ["GIGACHAT_CREDENTIALS"] = key
+    reset_gigachat_client()
+
+    # ВАЖНО: сам ключ в лог не пишем
+    logger.info("Ключ сохранён в %s", env_path)
+    return env_path
 
 
 def _resolve_timeout(timeout: Optional[float] = None) -> float:

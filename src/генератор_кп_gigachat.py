@@ -44,6 +44,7 @@ from llm_provider import (
     get_status_info,
     has_ssl_error,
     is_gigachat_configured,
+    save_gigachat_key,
     warmup_gigachat,
 )
 
@@ -1366,52 +1367,6 @@ def _run_diagnostics_async(dialog: "tk.Toplevel") -> None:
 # ============================================
 
 
-def _save_credentials_to_env(key: str) -> str:
-    """
-    Записывает ключ в .env, не затирая остальные настройки.
-
-    Путь выбирается с учётом режима запуска: для собранного .exe это файл
-    РЯДОМ С .EXE (внутрь архива PyInstaller писать нельзя), для исходников —
-    корень проекта.
-
-    Файл создаётся при необходимости. Старая строка с ключом удаляется,
-    новая добавляется в конец. Возвращает путь к .env.
-    """
-    env_path = get_env_write_path()
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = []
-
-    if os.path.exists(env_path):
-        # utf-8-sig: файл мог быть создан Блокнотом с BOM
-        with open(env_path, "r", encoding="utf-8-sig") as f:
-            lines = [
-                line.rstrip("\n")
-                for line in f
-                if not line.startswith("GIGACHAT_CREDENTIALS")
-            ]
-
-    if not lines:
-        lines = [
-            "GIGACHAT_SCOPE=GIGACHAT_API_PERS",
-            "GIGACHAT_MODEL=GigaChat",
-            "GIGACHAT_TIMEOUT=30",
-            "GIGACHAT_VERIFY_SSL_CERTS=true",
-            "GIGACHAT_CA_BUNDLE_FILE=",
-        ]
-    elif not any(line.startswith("GIGACHAT_CA_BUNDLE_FILE") for line in lines):
-        # Сохраняем настройку SSL, даже если её не было в старом файле
-        lines.append("GIGACHAT_CA_BUNDLE_FILE=")
-
-    lines.append(f"GIGACHAT_CREDENTIALS={key}")
-
-    # encoding="utf-8" без BOM: так файл читают и dotenv, и сам генератор
-    with open(env_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-    return str(env_path)
-
-
 def enter_api_key():
     """
     Диалог ввода API-ключа GigaChat.
@@ -1470,7 +1425,7 @@ def enter_api_key():
             return
 
         try:
-            env_path = _save_credentials_to_env(key)
+            env_path = save_gigachat_key(key)
         except Exception as e:
             logger.error("Не удалось сохранить ключ в .env: %s", e)
             messagebox.showerror(
@@ -1478,15 +1433,8 @@ def enter_api_key():
             )
             return
 
-        # Подхватываем новый ключ без перезапуска программы
-        os.environ["GIGACHAT_CREDENTIALS"] = key
-        try:
-            from llm_provider import reset_gigachat_client
-
-            reset_gigachat_client()
-        except Exception:
-            pass
-
+        # save_gigachat_key уже обновил os.environ и сбросил кэш клиента —
+        # перечитываем флаг готовности и обновляем интерфейс.
         GIGACHAT_READY = is_gigachat_configured()
         GIGACHAT_MODEL = get_status_info().get("gigachat_model", "GigaChat")
         AICache.clear()
