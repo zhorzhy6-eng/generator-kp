@@ -600,31 +600,43 @@ def smoke_test(exe_path: Path, timeout: float = 45.0) -> bool:
         print(f"     ❌ Не удалось запустить: {exc}")
         return False
 
-    # Ждём либо свежей записи в логе, либо завершения процесса
+    # Ждём либо свежей записи в логе, либо завершения процесса.
+    # exit_code остаётся None, пока процесс жив и работает штатно.
+    exit_code = None
     logging_started = False
-    while time.time() - started < timeout:
-        if proc.poll() is not None:
-            # Процесс завершился сам — для GUI это признак проблемы
-            print(f"     ❌ Процесс завершился сам, код {proc.returncode}")
-            return False
+    try:
+        while time.time() - started < timeout:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                # Процесс завершился сам — для GUI это признак проблемы
+                break
 
-        if newest_log_mtime() > mtime_before:
-            logging_started = True
-            break
+            if newest_log_mtime() > mtime_before:
+                logging_started = True
+                break
 
-        time.sleep(0.5)
+            time.sleep(0.5)
+    finally:
+        # Гасим процесс ВСЕГДА: даже если проверка не удалась или прервана
+        # (Ctrl+C). Иначе запущенный EXE держит свои файлы в dist\ и мешает
+        # следующей сборке — удаление падает с PermissionError, и это легко
+        # принять за выходку антивируса.
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        except Exception:
+            pass
 
     elapsed = time.time() - started
 
-    # Гасим процесс: время ожидания вышло, программа работает штатно
-    try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    except Exception:
-        pass
+    if exit_code is not None:
+        print(f"     ❌ Процесс завершился сам, код {exit_code}")
+        return False
 
     if logging_started:
         print(f"     ✅ Программа стартовала за {elapsed:.1f} с и пишет логи")
