@@ -526,11 +526,19 @@ def copy_to_desktop(
         except Exception as exc:
             print(f"     ⚠️  .env.example не скопирован: {exc}")
 
+    # Папка config\ рядом с .exe: программа ищет сертификат Минцифры именно
+    # там (_ca_bundle_dirs → sys.executable.parent/config). В сборке её нет
+    # «из коробки», поэтому создаём сразу — иначе пользователю пришлось бы
+    # угадывать, куда класть сертификат.
+    try:
+        (target / "config").mkdir(exist_ok=True)
+    except Exception as exc:
+        print(f"     ⚠️  Папка config не создана: {exc}")
+
     for name in ("russian_trusted_root_ca.cer", "settings.example.json"):
         item = CONFIG_DIR / name
         if item.is_file():
             try:
-                (target / "config").mkdir(exist_ok=True)
                 shutil.copy2(item, target / "config" / name)
                 print(f"     внутрь папки положен config/{name}")
             except Exception as exc:
@@ -710,15 +718,18 @@ def main() -> int:
         print("\n  ❌ Ни одна версия не собралась.")
         return 1
 
-    if not args.no_desktop:
-        step(6, "Копирование папок сборки на рабочий стол")
-        for bundle_name, exe_name, desktop_name in built:
-            copy_to_desktop(bundle_name, exe_name, desktop_name, args.desktop_dir)
-
+    # Пробный запуск идёт ПЕРЕД копированием намеренно: если он провалится
+    # (антивирус оборвал сборку, программа падает), сломанная копия не попадёт
+    # на рабочий стол. Вместе с программой копируются и созданные ею файлы.
     if not args.no_test:
-        step(7, "Проверка, что программа запускается")
+        step(6, "Проверка, что программа запускается")
         for bundle_name, exe_name, _ in built:
             smoke_test(DIST_DIR / bundle_name / exe_name)
+
+    if not args.no_desktop:
+        step(7, "Копирование папок сборки на рабочий стол")
+        for bundle_name, exe_name, desktop_name in built:
+            copy_to_desktop(bundle_name, exe_name, desktop_name, args.desktop_dir)
 
     # ---------- Итог ----------
     print()
