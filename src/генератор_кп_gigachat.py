@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from docx import Document
@@ -37,6 +38,7 @@ from logger_config import setup_logger, SETTINGS_PATH, PROJECT_ROOT, LOG_FILE as
 from llm_provider import (
     DEFAULT_SYSTEM_PROMPT,
     generate_gigachat,
+    get_ca_bundle_status,
     get_env_write_path,
     get_ssl_help,
     get_status_info,
@@ -106,6 +108,24 @@ AI_TIMEOUT = 30            # секунд, задаётся также в .env (
 GIGACHAT_SYSTEM_PROMPT = (
     DEFAULT_SYSTEM_PROMPT + " Отвечай строго 3 предложениями и коротким призывом к действию."
 )
+
+# Значения, которые считаем «ключ не задан» (для отчёта диагностики).
+# Держим копию списка из llm_provider: GUI не должен зависеть от приватных
+# констант провайдера, а расхождение здесь не критично — это только текст.
+_PLACEHOLDER_KEY_VALUES = {
+    "",
+    "your_key_here",
+    "your_key",
+    "changeme",
+    "none",
+    "null",
+    "вставьте_ключ",
+    "тут_ключ",
+}
+
+# Виджеты окна диагностики. Хранится ссылка на текстовое поле, чтобы
+# фоновый поток мог вернуть в него готовый отчёт через window.after().
+_diag_widgets: Dict[str, object] = {}
 
 # ============================================
 # НАСТРОЙКИ
@@ -985,46 +1005,360 @@ def show_key_warning():
     )
 
 
+def _diag_env_credential_state() -> str:
+    """
+    Определяет состояние ключа GigaChat В ФАЙЛЕ .env (не в окружении).
+
+    Нужно, чтобы отличить три разные ситуации: ключа нет вовсе, ключ есть,
+    ключ есть но выглядит затёртым/подстановочным. Возвращает строку для
+    отчёта диагностики. Сам ключ не показывается — только длина.
+    """
+    env_path = get_env_write_path()
+
+    try:
+        content = Path(env_path).read_text(encoding="utf-8-sig")
+    except Exception as exc:
+        return f"⚠️ не удалось прочитать .env: {exc}"
+
+    value = None
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("GIGACHAT_CREDENTIALS="):
+            value = line.split("=", 1)[1].strip()
+
+    if value is None:
+        return "❌ строки GIGACHAT_CREDENTIALS в .env нет"
+    if not value:
+        return "❌ GIGACHAT_CREDENTIALS пустой"
+    if value.lower() in _PLACEHOLDER_KEY_VALUES:
+        return f"⚠️ подстановочное значение ({value!r}) — вставьте настоящий ключ"
+    return f"✅ есть ({len(value)} символов, значение скрыто)"
+
+
+def _diag_certificate_section() -> List[str]:
+    """
+    Раздел отчёта про сертификат Минцифры: найден/не найден и что делать.
+
+    Проверка только файловая — без сетевых запросов, поэтому окно
+    диагностики открывается мгновенно.
+    """
+    lines: List[str] = []
+
+    try:
+        expected = get_ca_bundle_status()
+    except Exception as exc:
+        lines.append(f"⚠️ Не удалось проверить сертификат: {exc}")
+        lines.append("")
+        return lines
+
+    if expected.get("explicit"):
+        if expected.get("explicit_valid"):
+            lines.append(
+                f"✅ SSL-сертификат (из .env): {expected['explicit']}"
+            )
+        else:
+            lines.append("⚠️ SSL-сертификат Минцифры: путь в .env НЕ существует")
+            lines.append(f"   GIGACHAT_CA_BUNDLE_FILE={expected['explicit']}")
+    elif expected.get("found"):
+        lines.append(f"✅ SSL-сертификат Минцифры: найден")
+        lines.append(f"   Путь: {expected['found']}")
+        lines.append(
+            "   📌 Если GigaChat всё равно падает с SSL-ошибкой — антивирус"
+        )
+        lines.append(
+            "      подменяет сертификаты. Добавьте программу в исключения"
+        )
+        lines.append("      SSL-инспекции (Kaspersky: Настройки → Сеть → …).")
+    else:
+        lines.append("⚠️ SSL-сертификат Минцифры: НЕ НАЙДЕН")
+        lines.append(f"   Ожидаемое место: {expected['expected']}")
+        lines.append(f"   Скачать: {expected['url']}")
+        lines.append(
+            "   📌 Без сертификата GigaChat будет падать с SSL-ошибкой."
+        )
+        lines.append(
+            "      Программа при этом работает: текст КП берётся из шаблонов."
+        )
+
+    lines.append("")
+    lines.append("🔎 Где искали сертификат:")
+    for candidate in expected.get("search_paths", []):
+        lines.append(f"   - {candidate}")
+
+    lines.append(
+        f"   проверка SSL включена: {'да' if expected.get('verify_ssl') else 'НЕТ'}"
+    )
+    return lines
+
+
+def _build_diagnostics_report() -> str:
+    """
+    Собирает текст отчёта «📋 Диагностика».
+
+    Отдельная функция (а не тело обработчика кнопки) нужна, чтобы отчёт
+    можно было собирать в фоновом потоке: если писать его прямо в кнопке,
+    интерфейс замирает на время проверки.
+    """
+    import platform
+
+    lines: List[str] = ["🔍 ДИАГНОСТИКА", "=" * 46, ""]
+
+    # ---------- .env ----------
+    env_path = get_env_write_path()
+    env_size = "—"
+    try:
+        if Path(env_path).exists():
+            env_size = f"{Path(env_path).stat().st_size} байт"
+            lines.append(f"✅ .env найден: {env_path} ({env_size})")
+        else:
+            lines.append(f"❌ .env НЕ найден: {env_path}")
+    except Exception as exc:
+        lines.append(f"⚠️ .env: не удалось прочитать {env_path} ({exc})")
+
+    lines.append(f"   ключ GigaChat: {_diag_env_credential_state()}")
+    lines.append(f"   модель: {os.environ.get('GIGACHAT_MODEL', 'GigaChat')}")
+    lines.append(
+        f"   scope: {os.environ.get('GIGACHAT_SCOPE', 'GIGACHAT_API_PERS')}"
+    )
+    lines.append(
+        f"   таймаут запроса: {os.environ.get('GIGACHAT_TIMEOUT', '30')} сек"
+    )
+    lines.append(f"   режим запуска: {'собранный EXE' if STATUS_INFO.get('frozen') else 'исходники'}")
+    lines.append("")
+
+    # ---------- SSL ----------
+    lines += _diag_certificate_section()
+    lines.append("")
+
+    # ---------- Логи ----------
+    try:
+        log_module = sys.modules.get("logger_config")
+        log_path = getattr(log_module, "LOG_FILE", None) or str(LOG_FILE_HINT)
+        warn = getattr(log_module, "_LOG_WARNING", None)
+        lines.append(f"✅ Логгер: пишет в {log_path}")
+        if warn:
+            # _LOG_WARNING = «<причина> — логи перенесены в <папка> (…)».
+            # Путь уже показан строкой выше, поэтому берём только причину.
+            reason = str(warn).split(" — ", 1)[0].strip() or str(warn)
+            lines.append(f"   ⚠️ {reason}")
+    except Exception as exc:
+        lines.append(f"⚠️ Логгер: не удалось определить путь ({exc})")
+    lines.append("")
+
+    # ---------- Мьютекс ----------
+    if _mutex_handle is None and not _already_running:
+        lines.append("✅ Мьютекс: свободен (это единственная копия программы)")
+    elif _already_running:
+        lines.append(
+            "⚠️ Мьютекс: занят другой копией программы — эта работает вторым экземпляром"
+        )
+    else:
+        lines.append("✅ Мьютекс: получен")
+    lines.append("")
+
+    # ---------- Окружение ----------
+    lines.append(f"✅ Python: {platform.python_version()} ({sys.executable})")
+    lines.append("✅ tkinter: OK")
+
+    for module_name, human in (
+        ("docx", "python-docx"),
+        ("pyperclip", "pyperclip"),
+        ("dotenv", "python-dotenv"),
+        ("gigachat", "gigachat"),
+        ("requests", "requests"),
+    ):
+        try:
+            __import__(module_name)
+            lines.append(f"✅ {human}: OK")
+        except Exception as exc:
+            lines.append(f"❌ {human}: НЕ установлен ({exc})")
+            lines.append(f"   Решение: pip install -r requirements.txt")
+
+    lines.append("")
+
+    # ---------- SSL-ошибка в этой сессии ----------
+    if has_ssl_error():
+        lines.append("⚠️ В этой сессии уже была SSL-ошибка — см. раздел SSL выше")
+        lines.append("")
+
+    # ---------- Итог ----------
+    ca_ok = False
+    try:
+        status = get_ca_bundle_status()
+        ca_ok = bool(status.get("found")) or bool(status.get("explicit_valid"))
+    except Exception:
+        ca_ok = False
+
+    if not GIGACHAT_READY:
+        lines.append("📊 Итог: программа запустится, но ИИ выключен —")
+        lines.append("         ключ GigaChat не задан. Нажмите «🔑 Ключ».")
+    elif ca_ok:
+        lines.append("📊 Итог: всё на месте — GigaChat должен отвечать.")
+    else:
+        lines.append("📊 Итог: программа запустится, но GigaChat не будет отвечать")
+        lines.append("         до установки сертификата Минцифры (fallback на шаблоны).")
+
+    return "\n".join(lines)
+
+
+def _diag_show_progress(dialog: "tk.Toplevel", text: "tk.Text") -> None:
+    """Заглушка «идёт проверка», чтобы окно не выглядело зависшим."""
+    text.config(state="normal")
+    text.delete("1.0", "end")
+    text.insert("1.0", "🔍 Идёт диагностика, подождите…")
+    text.config(state="disabled")
+
+
+def _show_diagnostics_result(dialog: "tk.Toplevel", report: str) -> None:
+    """Показывает готовый отчёт в уже открытом окне."""
+    try:
+        text = _diag_widgets.get("text")
+        if text is None or not text.winfo_exists():
+            return
+        text.config(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", report)
+        text.config(state="disabled")
+        text.see("1.0")
+    except Exception as exc:
+        logger.warning("Не удалось показать диагностику: %s", exc)
+
+
 def show_diagnostics():
     """
-    Кнопка «Диагностика»: показывает, что программа реально видит.
+    Кнопка «📋 Диагностика»: показывает, что программа реально видит.
 
-    Специально выведена в интерфейс: при проблемах запуска пользователю
-    не нужно искать логи — видно, какой .env найден, есть ли ключ и
-    подхватился ли сертификат Минцифры.
+    Окно с прокруткой и возможностью скопировать текст: отчёт длинный
+    (ключ, .env, сертификат Минцифры, логи, зависимости, итог), а
+    messagebox такое не вмещает и не даёт выделить.
+
+    Сбор отчёта идёт в фоновом потоке, а результат возвращается в главный
+    поток через window.after(): обращаться к виджетам из другого потока
+    нельзя.
     """
-    try:
-        info = get_status_info()
-    except Exception as e:
-        messagebox.showerror("Диагностика", f"❌ Не удалось собрать сведения:\n{e}")
-        return
+    dialog = tk.Toplevel(window)
+    dialog.title("📋 Диагностика")
+    dialog.configure(bg=BG_COLOR)
+    dialog.transient(window)
 
-    lines = [
-        f"Режим: {'собранный EXE' if info.get('frozen') else 'исходники'}",
-        "",
-        "🔑 КЛЮЧ GIGACHAT",
-        f"  настроен: {info['gigachat_configured']}",
-        f"  credentials: {info['gigachat_credentials']}",
-        f"  модель: {info['gigachat_model']}",
-        f"  .env: {info['env_path']}",
-        f"  .env существует: {info['env_exists']}",
-        "",
-        "📄 ГДЕ ИСКАЛИ .env",
-    ]
-    lines += [f"  {p}" for p in info.get("env_found_paths", [])]
-    lines += [
-        "",
-        "🌐 SSL",
-        f"  сертификат задан: {info.get('ca_bundle') or '— нет —'}",
-        f"  найден в проекте: {info.get('ca_bundle_found') or 'нет'}",
-        f"  ожидаемый путь: {info.get('ca_bundle_expected')}",
-        f"  SSL-ошибка: {'да' if info.get('ssl_error') else 'нет'}",
-        "",
-        "📝 ЛОГИ",
-        f"  {getattr(sys.modules.get('logger_config'), 'LOG_FILE', 'см. папку logs')}",
-    ]
+    tk.Label(
+        dialog,
+        text="📋 Диагностика программы",
+        font=("Arial", 12, "bold"),
+        bg=BG_COLOR,
+    ).pack(pady=(12, 4))
 
-    messagebox.showinfo("Диагностика", "\n".join(lines))
+    frame = tk.Frame(dialog, bg=BG_COLOR)
+    frame.pack(padx=12, pady=5, fill="both", expand=True)
+
+    text = tk.Text(
+        frame, width=92, height=30, wrap="word", font=("Consolas", 9), bg="white"
+    )
+    scrollbar = tk.Scrollbar(frame, command=text.yview)
+    text.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side="right", fill="y")
+    text.pack(side="left", fill="both", expand=True)
+
+    _diag_widgets["text"] = text
+    _diag_show_progress(dialog, text)
+
+    buttons = tk.Frame(dialog, bg=BG_COLOR)
+    buttons.pack(pady=10)
+
+    def copy_report():
+        try:
+            content = text.get("1.0", "end").strip()
+            pyperclip.copy(content)
+            messagebox.showinfo("Диагностика", "Отчёт скопирован в буфер обмена.", parent=dialog)
+        except Exception as exc:
+            messagebox.showwarning(
+                "Диагностика", f"Не удалось скопировать: {exc}", parent=dialog
+            )
+
+    def refresh():
+        _diag_show_progress(dialog, text)
+        _run_diagnostics_async(dialog)
+
+    tk.Button(
+        buttons,
+        text="🔄 Обновить",
+        font=("Arial", 9),
+        bg="#2196F3",
+        fg="white",
+        padx=12,
+        pady=4,
+        cursor="hand2",
+        command=refresh,
+    ).pack(side="left", padx=4)
+
+    tk.Button(
+        buttons,
+        text="📄 Скопировать отчёт",
+        font=("Arial", 9),
+        bg="#455A64",
+        fg="white",
+        padx=12,
+        pady=4,
+        cursor="hand2",
+        command=copy_report,
+    ).pack(side="left", padx=4)
+
+    tk.Button(
+        buttons,
+        text="🌐 Как исправить SSL",
+        font=("Arial", 9),
+        bg="#c62828",
+        fg="white",
+        padx=12,
+        pady=4,
+        cursor="hand2",
+        command=show_ssl_help,
+    ).pack(side="left", padx=4)
+
+    tk.Button(
+        buttons,
+        text="Закрыть",
+        font=("Arial", 9),
+        bg="#9E9E9E",
+        fg="white",
+        padx=12,
+        pady=4,
+        cursor="hand2",
+        command=dialog.destroy,
+    ).pack(side="left", padx=4)
+
+    dialog.bind("<Escape>", lambda event: dialog.destroy())
+
+    _run_diagnostics_async(dialog)
+    text.see("1.0")
+
+
+def _run_diagnostics_async(dialog: "tk.Toplevel") -> None:
+    """
+    Собирает отчёт в фоновом потоке и отдаёт его в главный поток.
+
+    Исключения не пробрасываются наружу: диагностика не должна ронять
+    программу — при сбое в окне будет понятная ошибка.
+    """
+    def worker():
+        try:
+            report = _build_diagnostics_report()
+        except Exception as exc:
+            logger.error("Диагностика упала: %s", exc, exc_info=True)
+            report = (
+                "❌ Не удалось собрать сведения\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"Подробности в логе:\n{LOG_FILE_HINT}"
+            )
+
+        try:
+            window.after(0, lambda: _show_diagnostics_result(dialog, report))
+        except Exception:
+            # Окно уже закрыто — это нормально, просто нечего показывать
+            pass
+
+    threading.Thread(target=worker, name="diagnostics", daemon=True).start()
+
 
 
 # ============================================
@@ -1348,7 +1682,12 @@ if not GIGACHAT_READY:
     )
     key_warning_label.pack(pady=3)
 
-# Плашка про SSL: показывается, когда запрос упал по сертификату
+# Плашка про SSL. Показывается в двух случаях:
+#   1. СРАЗУ при старте — сертификата Минцифры нет, а ключ задан. Тогда
+#      GigaChat заведомо не ответит, и пользователь узнаёт об этом до
+#      первого нажатия «Сгенерировать» (раньше — только по факту ошибки).
+#   2. После падения запроса по сертификату (has_ssl_error()).
+# Плашка немодальная: она ничего не блокирует и не мешает работать.
 ssl_banner = tk.Frame(window, bg="#ffcdd2")
 ssl_label = tk.Label(
     ssl_banner,
@@ -1356,6 +1695,7 @@ ssl_label = tk.Label(
     font=("Arial", 9, "bold"),
     fg="#b71c1c",
     bg="#ffcdd2",
+    justify="left",
 )
 ssl_label.pack(side="left", padx=8, pady=3)
 tk.Button(
@@ -1371,9 +1711,56 @@ tk.Button(
 ).pack(side="left", padx=4, pady=3)
 
 
-def update_ssl_banner() -> None:
+def _certificate_present() -> bool:
     """
-    Показывает красную плашку, если последний запрос упал по SSL.
+    Есть ли корневой сертификат Минцифры (файл, без сетевых проверок).
+
+    Нужна и для плашки при старте, и для отчёта диагностики.
+    """
+    try:
+        status = get_ca_bundle_status()
+    except Exception as exc:
+        logger.debug("Не удалось проверить наличие сертификата: %s", exc)
+        return False
+    return bool(status.get("found")) or bool(status.get("explicit_valid"))
+
+
+def _startup_ssl_check() -> None:
+    """
+    Проверка сертификата при старте: показать проблему ДО первого запроса.
+
+    Вызывается из _run_gui перед mainloop(). Сертификат проверяется один
+    раз, чтобы в лог не попадало одно и то же предупреждение дважды.
+    Ошибки проверки не должны мешать запуску окна.
+    """
+    try:
+        cert_ok = _certificate_present()
+
+        if GIGACHAT_READY and not cert_ok:
+            logger.warning(
+                "SSL: корневой сертификат Минцифры не найден — GigaChat, "
+                "скорее всего, не ответит. Программа будет работать на "
+                "шаблонах. Скачать сертификат: %s",
+                get_ca_bundle_status().get("url"),
+            )
+
+        update_ssl_banner(cert_ok)
+    except Exception as exc:  # pragma: no cover
+        logger.debug("Стартовая проверка сертификата не удалась: %s", exc)
+
+
+def update_ssl_banner(cert_ok: Optional[bool] = None) -> None:
+    """
+    Обновляет состояние плашки SSL.
+
+    Показывает предупреждение, если сертификат Минцифры отсутствует (при
+    заданном ключе) ИЛИ если запрос уже упал по SSL. Скрывает, когда всё
+    в порядке.
+
+    Args:
+        cert_ok: результат проверки сертификата. None — проверить здесь
+                 (при старте проверка уже сделана и передаётся готовой,
+                 чтобы не писать одно предупреждение в лог дважды).
 
     Проверяем winfo_manager(), а НЕ winfo_ismapped(): у окна, которое ещё
     не отрисовано (или свёрнуто), ismapped() возвращает 0 даже когда плашка
@@ -1384,8 +1771,29 @@ def update_ssl_banner() -> None:
     в Tkinter нельзя.
     """
     try:
+        if cert_ok is None:
+            cert_ok = _certificate_present() if GIGACHAT_READY else True
+
+        need_banner = has_ssl_error() or (GIGACHAT_READY and not cert_ok)
+
+        if need_banner:
+            if has_ssl_error():
+                ssl_label.config(
+                    text=(
+                        "⚠️ SSL: не удалось проверить сертификат GigaChat.\n"
+                        "GigaChat не отвечает — текст КП берётся из шаблонов."
+                    )
+                )
+            else:
+                ssl_label.config(
+                    text=(
+                        "⚠️ SSL-сертификат Минцифры не найден. "
+                        "GigaChat может не отвечать. [Как исправить]"
+                    )
+                )
+
         shown = bool(ssl_banner.winfo_manager())
-        if has_ssl_error():
+        if need_banner:
             if not shown:
                 ssl_banner.pack(fill="x", padx=20, pady=4)
         else:
@@ -1393,6 +1801,7 @@ def update_ssl_banner() -> None:
                 ssl_banner.pack_forget()
     except Exception as exc:
         logger.debug("Не удалось обновить SSL-плашку: %s", exc)
+
 
 ai_control_frame = tk.Frame(window, bg=BG_COLOR)
 ai_control_frame.pack(pady=5)
@@ -1691,6 +2100,11 @@ tk.Button(
 
 logger.info("Интерфейс загружен")
 
+# Плашку SSL выставляем сразу после построения окна: если сертификата нет,
+# пользователь видит предупреждение ещё до первого запроса к GigaChat.
+# Повторная (уже без записи в лог) проверка — в _run_gui перед mainloop().
+update_ssl_banner()
+
 
 def _run_gui() -> int:
     """
@@ -1707,6 +2121,10 @@ def _run_gui() -> int:
     """
     # Обработчик крестика: закрытие всегда идёт через destroy() и попадает в лог
     window.protocol("WM_DELETE_WINDOW", on_closing)
+
+    # Плашка SSL проверяется ещё раз перед показом окна: так пользователь
+    # видит проблему с сертификатом сразу, а не после нажатия «Сгенерировать»
+    _startup_ssl_check()
 
     # Первый предпросмотр и прогрев авторизации — в фоне, окно открывается сразу
     window.after(100, refresh_preview_async)

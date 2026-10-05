@@ -222,6 +222,113 @@ def setup_ca_bundle(logger_: Optional[Any] = None) -> Optional[str]:
     return None
 
 
+def get_ca_bundle_status() -> Dict[str, Any]:
+    """
+    Полный статус сертификата Минцифры — для диагностики в интерфейсе и логе.
+
+    Returns:
+        found:          путь к подключённому сертификату или None;
+        expected:       путь, где сертификат ищут в первую очередь;
+        search_paths:   все места поиска (в порядке приоритета);
+        explicit:       путь, заданный вручную в GIGACHAT_CA_BUNDLE_FILE;
+        explicit_valid: существует ли файл, заданный вручную;
+        verify_ssl:     включена ли проверка сертификата;
+        url:            официальный адрес загрузки сертификата.
+    """
+    found = find_ca_bundle()
+    explicit = (os.environ.get("GIGACHAT_CA_BUNDLE_FILE") or "").strip()
+    explicit_valid = bool(explicit) and os.path.isfile(explicit)
+
+    # Список путей без повторов: в исходниках PROJECT_ROOT и cwd — одна и та
+    # же папка, и дубли только запутывают диагностику.
+    search_paths: List[str] = []
+    for directory in _ca_bundle_dirs():
+        candidate = str(directory / CA_BUNDLE_FILENAME)
+        if candidate not in search_paths:
+            search_paths.append(candidate)
+
+    return {
+        "found": str(found) if found else None,
+        "expected": str(_ca_bundle_dirs()[0] / CA_BUNDLE_FILENAME),
+        "search_paths": search_paths,
+        "explicit": explicit or None,
+        "explicit_valid": explicit_valid,
+        "verify_ssl": os.environ.get("GIGACHAT_VERIFY_SSL_CERTS", "true").strip().lower()
+        != "false",
+        "url": CA_BUNDLE_URL,
+    }
+
+
+def log_ssl_error_context(error: Any, logger_: Optional[Any] = None) -> None:
+    """
+    Пишет в лог ПОЛНЫЙ контекст SSL-ошибки, чтобы её можно было разобрать
+    без повторного воспроизведения:
+
+      * traceback (для отладки);
+      * понятную причину «сертификат не найден / невалиден»;
+      * все пути, где сертификат искали;
+      * подсказку, где сертификат скачать.
+
+    Ключи и токены в лог не попадают: текст ошибки проходит scrub_text().
+    """
+    log = logger_ or logger
+
+    try:
+        status = get_ca_bundle_status()
+    except Exception as exc:  # pragma: no cover — диагностика не должна падать
+        log.warning("Не удалось собрать статус CA-сертификата: %s", exc)
+        return
+
+    log.error("SSL: не удалось проверить сертификат GigaChat")
+
+    if status["explicit"]:
+        if status["explicit_valid"]:
+            log.error(
+                "SSL: используется сертификат из .env (GIGACHAT_CA_BUNDLE_FILE): %s",
+                status["explicit"],
+            )
+        else:
+            log.error(
+                "SSL: GIGACHAT_CA_BUNDLE_FILE указывает на НЕсуществующий файл: %s",
+                status["explicit"],
+            )
+    elif status["found"]:
+        log.error(
+            "SSL: сертификат Минцифры найден (%s), но проверка всё равно не прошла — "
+            "скорее всего антивирус или прокси подменяет сертификат своим. "
+            "Добавьте программу в исключения SSL-инспекции.",
+            status["found"],
+        )
+    else:
+        log.error(
+            "SSL: корневой сертификат Минцифры НЕ НАЙДЕН — подмена TLS "
+            "подтверждается только этим сертификатом"
+        )
+
+    log.error("SSL: искали сертификат в:")
+    for candidate in status["search_paths"]:
+        log.error("SSL:   - %s", candidate)
+
+    log.error("SSL: скачайте сертификат: %s", status["url"])
+    log.error(
+        "SSL: проверка сертификата включена (verify_ssl=%s). Отключать её не нужно — "
+        "она защищает от подмены трафика.",
+        status["verify_ssl"],
+    )
+    log.error(
+        "SSL: тип ошибки: %s | текст: %s",
+        type(error).__name__,
+        scrub_text(str(error)),
+    )
+
+    # traceback — последним: он длинный, но именно он нужен при разборе
+    tb = getattr(error, "__traceback__", None)
+    if tb is not None:
+        log.error("SSL: traceback:", exc_info=(type(error), error, tb))
+    else:
+        log.error("SSL: traceback недоступен (исключение без __traceback__)")
+
+
 def get_ssl_help() -> str:
     """
     Инструкция по исправлению SSL-ошибки — показывается в GUI и в логе.
@@ -260,6 +367,9 @@ def log_ssl_help(logger_: Optional[Any] = None) -> None:
 # Используем общий логгер проекта. Если импорт не удался (например, модуль
 # запущен вне структуры проекта) — падаем на стандартный logging, чтобы
 # провайдер оставался полностью автономным.
+#
+# ВАЖНО: блок логгера обязан оставаться ВЫШЕ функций, которые пишут в лог:
+# иначе имя logger ещё не существует в момент определения функции.
 
 try:
     from logger_config import setup_logger
@@ -269,6 +379,7 @@ except Exception:  # pragma: no cover
     import logging
 
     logger = logging.getLogger(__name__)
+
 
 # ============================================
 # КОНСТАНТЫ
@@ -401,6 +512,7 @@ def is_gigachat_configured() -> bool:
 
 _gigachat_client: Optional[Any] = None
 _gigachat_config_key: Optional[tuple] = None
+_gigachat_client_timeout: Optional[float] = None
 
 
 def _current_config_key() -> tuple:
@@ -419,7 +531,7 @@ def reset_gigachat_client() -> None:
     Сбрасывает кэшированный клиент (например, после смены ключа без перезапуска
     программы). Старое соединение закрывается, ошибки игнорируются.
     """
-    global _gigachat_client, _gigachat_config_key
+    global _gigachat_client, _gigachat_config_key, _gigachat_client_timeout
 
     if _gigachat_client is not None:
         try:
@@ -429,30 +541,66 @@ def reset_gigachat_client() -> None:
 
     _gigachat_client = None
     _gigachat_config_key = None
+    _gigachat_client_timeout = None
     logger.info("Клиент GigaChat сброшен")
 
 
-def _get_gigachat_client() -> Optional[Any]:
+def _resolve_timeout(timeout: Optional[float] = None) -> float:
+    """
+    Возвращает таймаут клиента в секундах.
+
+    Приоритет: аргумент вызова → GIGACHAT_TIMEOUT из .env → значение
+    по умолчанию. Некорректное значение в .env не ломает запрос, а
+    откатывается к значению по умолчанию (с предупреждением в лог).
+    """
+    if timeout is not None:
+        try:
+            value = float(timeout)
+            if value > 0:
+                return value
+            logger.warning(
+                "Некорректный timeout=%r — использую значение по умолчанию", timeout
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректный timeout=%r — использую значение по умолчанию", timeout
+            )
+
+    try:
+        return float(os.environ.get("GIGACHAT_TIMEOUT", DEFAULT_GIGACHAT_TIMEOUT))
+    except (TypeError, ValueError):
+        logger.warning("Некорректный GIGACHAT_TIMEOUT — использую значение по умолчанию")
+        return DEFAULT_GIGACHAT_TIMEOUT
+
+
+def _get_gigachat_client(timeout: Optional[float] = None) -> Optional[Any]:
     """
     Возвращает клиент GigaChat, создавая его лениво при первом вызове.
 
     Ленивость важна: отсутствие ключа или библиотеки не должно ломать
     программу на старте — GUI должен открыться и показать статус.
+
+    timeout — необязательный таймаут конкретного вызова (секунды). Такие
+    клиенты по умолчанию НЕ кэшируются: клиент с «чужим» таймаутом,
+    оставшийся в кэше, менял бы поведение следующих запросов. Исключение —
+    успешный вызов, после которого клиент становится основным.
     """
-    global _gigachat_client, _gigachat_config_key
+    global _gigachat_client, _gigachat_config_key, _gigachat_client_timeout
 
     if not is_gigachat_configured():
         logger.warning("GigaChat не настроен: GIGACHAT_CREDENTIALS не задан в .env")
         return None
 
     config_key = _current_config_key()
+    effective_timeout = _resolve_timeout(timeout)
 
-    # Клиент уже создан и конфигурация не менялась — переиспользуем
+    # Клиент уже создан, конфигурация не менялась и таймаут тот же — переиспользуем
     if _gigachat_client is not None and _gigachat_config_key == config_key:
-        return _gigachat_client
+        if _gigachat_client_timeout is None or _gigachat_client_timeout == effective_timeout:
+            return _gigachat_client
 
     # Конфигурация изменилась — пересоздаём
-    if _gigachat_client is not None:
+    if _gigachat_client is not None and _gigachat_config_key != config_key:
         logger.info("Конфигурация GigaChat изменилась — пересоздаю клиент")
         reset_gigachat_client()
 
@@ -469,11 +617,7 @@ def _get_gigachat_client() -> Optional[Any]:
     scope = os.environ.get("GIGACHAT_SCOPE", DEFAULT_GIGACHAT_SCOPE).strip()
     model = os.environ.get("GIGACHAT_MODEL", DEFAULT_GIGACHAT_MODEL).strip()
 
-    try:
-        timeout = float(os.environ.get("GIGACHAT_TIMEOUT", DEFAULT_GIGACHAT_TIMEOUT))
-    except (TypeError, ValueError):
-        logger.warning("Некорректный GIGACHAT_TIMEOUT — использую значение по умолчанию")
-        timeout = DEFAULT_GIGACHAT_TIMEOUT
+    timeout = effective_timeout
 
     # SSL-верификация включена, если явно не отключена ("false")
     verify_ssl = (
@@ -500,8 +644,14 @@ def _get_gigachat_client() -> Optional[Any]:
         client_kwargs["base_url"] = base_url
 
     try:
-        _gigachat_client = GigaChat(**client_kwargs)
-        _gigachat_config_key = config_key
+        client = GigaChat(**client_kwargs)
+
+        # Клиент с нестандартным таймаутом оставляем вызывающему коду:
+        # в общий кэш он не попадает, если это разовый вызов.
+        if timeout == _resolve_timeout():
+            _gigachat_client = client
+            _gigachat_config_key = config_key
+            _gigachat_client_timeout = timeout
 
         # ВАЖНО: сам ключ не логируем — только маску
         logger.info(
@@ -514,12 +664,13 @@ def _get_gigachat_client() -> Optional[Any]:
             verify_ssl,
             ca_bundle or "системный",
         )
-        return _gigachat_client
+        return client
 
     except Exception as e:
         logger.error("Не удалось создать клиент GigaChat: %s", scrub_text(str(e)))
         _gigachat_client = None
         _gigachat_config_key = None
+        _gigachat_client_timeout = None
         return None
 
 
@@ -692,6 +843,7 @@ def generate_gigachat(
     temperature: float = 0.85,
     max_tokens: int = 280,
     use_stream: bool = True,
+    timeout: Optional[float] = None,
 ) -> Optional[str]:
     """
     Генерирует текст через GigaChat.
@@ -702,6 +854,10 @@ def generate_gigachat(
         temperature:   креативность (0.0–2.0)
         max_tokens:    ограничение длины ответа (меньше = быстрее)
         use_stream:    потоковая генерация (быстрее отдаёт первый токен)
+        timeout:       таймаут запроса в секундах; None — взять GIGACHAT_TIMEOUT
+                       из .env (по умолчанию 30 с). Запрос ВСЕГДА ограничен
+                       таймаутом: «зависнуть» на недоступной сети программа
+                       не должна.
 
     Returns:
         Текст ответа или None при любой ошибке. Исключения не выбрасываются.
@@ -717,7 +873,7 @@ def generate_gigachat(
         logger.warning("generate_gigachat: ключ GigaChat не задан (см. .env)")
         return None
 
-    client = _get_gigachat_client()
+    client = _get_gigachat_client(timeout)
     if client is None:
         return None
 
@@ -784,9 +940,12 @@ def generate_gigachat(
             reset_gigachat_client()
 
         # SSL — отдельная причина: дело не в ключе и не в сети, а в проверке
-        # сертификата. Запоминаем, чтобы интерфейс показал плашку «см. README».
+        # сертификата. Пишем в лог полный контекст (traceback, пути поиска
+        # сертификата, ссылку на скачивание) и запоминаем, чтобы интерфейс
+        # показал плашку «как исправить».
         if is_ssl_error(e):
             note_ssl_error(e)
+            log_ssl_error_context(e)
 
         return None
 
