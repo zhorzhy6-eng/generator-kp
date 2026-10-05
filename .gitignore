@@ -52,6 +52,12 @@ Desktop.ini
 ca_bundle_merged.pem
 config/ca_bundle_merged.pem
 
+# Служебные файлы программы (временные сертификаты, список корней Windows)
+runtime/
+gigachat_roots/
+gigachat_windows_roots.txt
+gigachat_extra_root_*.pem
+
 # === Секреты (GigaChat API и т.п.) ===
 .env
 .env.local

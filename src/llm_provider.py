@@ -411,16 +411,16 @@ def get_work_dir() -> Path:
     Рабочая папка для служебных файлов программы (временные сертификаты и т.п.).
 
     Почему не просто tempfile.gettempdir(): внутри собранного .exe системная
-    временная папка определяется не всегда — тогда Python подставляет
-    текущий каталог, и служебные файлы начинали сыпаться прямо в папку
-    программы. Выглядит это как мусор рядом с .exe, а на машине, где папка
-    доступна только для чтения, программа вообще не смогла бы собрать набор
-    сертификатов.
+    временная папка может определиться как папка самой программы — и тогда
+    служебные файлы сыпались рядом с .exe. Это выглядит как мусор, а на
+    машине, где папка программы доступна только для чтения, программа
+    вообще не смогла бы собрать набор сертификатов.
 
     Порядок выбора:
-      1. системная временная папка (обычный случай);
-      2. подпапка runtime рядом с программой (если временная недоступна);
-      3. папка программы (последний вариант).
+      1. системная временная папка, но только если это НЕ папка программы
+         (иначе получится ровно тот мусор, от которого уходим);
+      2. подпапка runtime рядом с программой;
+      3. подпапка программы (последний вариант — работать важнее, чем чистота).
     """
     if _WORK_DIR_CACHE["path"] is not None:
         return _WORK_DIR_CACHE["path"]
@@ -438,15 +438,26 @@ def get_work_dir() -> Path:
         except Exception:
             return False
 
+    def is_app_dir(path: Path) -> bool:
+        """True, если это сама папка программы (или лежит внутри неё)."""
+        return _is_path_inside(path, PROJECT_ROOT)
+
     candidates: List[Path] = []
+
+    system_temp: Optional[Path] = None
     try:
-        candidates.append(Path(tempfile.gettempdir()))
+        system_temp = Path(tempfile.gettempdir())
     except Exception:
-        pass
-    try:
-        candidates.append(Path(tempfile.gettempdir()) / "GeneratorKP")
-    except Exception:
-        pass
+        system_temp = None
+
+    # Системная временная папка — обычный и самый правильный вариант
+    if system_temp is not None and not is_app_dir(system_temp):
+        candidates.append(system_temp)
+    # Внутри неё — своя подпапка: на случай, если корень временной папки
+    # недоступен для записи (бывает при жёстких политиках).
+    if system_temp is not None and not is_app_dir(system_temp):
+        candidates.append(system_temp / "GeneratorKP")
+    # Рядом с программой — только в подпапку, чтобы не мусорить в корне
     try:
         candidates.append(PROJECT_ROOT / "runtime")
     except Exception:
@@ -456,10 +467,55 @@ def get_work_dir() -> Path:
     for candidate in candidates:
         if usable(candidate):
             _WORK_DIR_CACHE["path"] = candidate
+            logger.debug("Служебная папка программы: %s", candidate)
             return candidate
 
     _WORK_DIR_CACHE["path"] = PROJECT_ROOT
+    logger.debug("Служебная папка программы (запасной вариант): %s", PROJECT_ROOT)
     return PROJECT_ROOT
+
+
+def make_work_subdir(name: str) -> Path:
+    """
+    Возвращает подпапку рабочей папки с указанным именем и переносит туда
+    файлы, оставшиеся от прошлых версий программы в корне папки программы.
+
+    Нужна для чистоты: раньше служебные файлы могли попасть прямо в папку
+    программы, и они там так и оставались.
+    """
+    directory = get_work_dir() / name
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return directory
+
+    # Переносим возможные «старые» файлы из корня папки программы
+    try:
+        legacy_files = [PROJECT_ROOT / name]
+        if name == "gigachat_roots":
+            legacy_files.append(PROJECT_ROOT / "gigachat_windows_roots.txt")
+        for legacy in legacy_files:
+            if legacy == directory or not legacy.exists():
+                continue
+            if legacy.is_dir():
+                for item in legacy.iterdir():
+                    try:
+                        item.replace(directory / item.name)
+                    except Exception:
+                        pass
+                try:
+                    legacy.rmdir()
+                except OSError:
+                    pass
+            else:
+                try:
+                    legacy.replace(directory / legacy.name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return directory
 
 
 def _copy_windows_cert_to_pem(cert_id: str, pem_text: str) -> Optional[Path]:
@@ -694,7 +750,7 @@ def _scan_windows_root_names() -> List[Tuple[str, str]]:
 
     # Разделитель "|" и перевод строки вместо TAB: значение Subject не может
     # содержать перевод строки, а кириллица спокойно живёт в UTF-8.
-    out_file = get_work_dir() / "gigachat_windows_roots.txt"
+    out_file = make_work_subdir("gigachat_roots") / "windows_roots.txt"
     quoted = str(out_file).replace("'", "''")
 
     script = (
@@ -899,9 +955,7 @@ def _interceptor_pem_files(exclude: Optional[Path] = None) -> List[Tuple[Path, s
     Сначала проверяются уже выгруженные файлы (быстро, без запуска
     PowerShell), и только если их нет — читается хранилище Windows.
     """
-    import tempfile
-
-    out_dir = Path(tempfile.gettempdir()) / "gigachat_roots"
+    out_dir = make_work_subdir("gigachat_roots")
 
     cached = _read_cached_interceptor_pems(out_dir)
     if cached:
@@ -1028,7 +1082,7 @@ def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
             return False
         return False
 
-    for known_path in (target, Path(tempfile.gettempdir()) / MERGED_CA_BUNDLE_FILENAME):
+    for known_path in (target, get_work_dir() / MERGED_CA_BUNDLE_FILENAME):
         if is_current(known_path):
             return known_path
 
@@ -1093,21 +1147,19 @@ def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
         except Exception:
             return None
 
-    import tempfile
-
     # Порядок попыток: сначала config\ рядом с программой (файл виден
-    # пользователю), затем временная папка. Папка программы может быть
+    # пользователю), затем рабочая папка. Папка программы может быть
     # защищена от записи (Program Files, права администратора, антивирус) —
     # тогда программа всё равно должна получить рабочий набор сертификатов,
     # а не остаться без проверки TLS.
     written = try_write(target)
     if written is None:
-        fallback = Path(tempfile.gettempdir()) / MERGED_CA_BUNDLE_FILENAME
+        fallback = get_work_dir() / MERGED_CA_BUNDLE_FILENAME
         written = try_write(fallback)
         if written is not None:
             log.info(
                 "SSL: папка config\\ недоступна для записи (%s) — набор "
-                "сертификатов собран во временной папке: %s",
+                "сертификатов собран в рабочей папке: %s",
                 target,
                 written,
             )
