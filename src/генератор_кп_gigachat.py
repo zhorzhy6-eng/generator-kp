@@ -21,31 +21,78 @@ import os
 import random
 import json
 import re
+import sys
 import threading
 import time
+import traceback
 from typing import Dict, List, Optional, Tuple
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # Импортируем общий модуль: пути проекта и логгер
-from logger_config import setup_logger, SETTINGS_PATH
+from logger_config import setup_logger, SETTINGS_PATH, PROJECT_ROOT, LOG_FILE as LOG_FILE_HINT
 
 # Единый провайдер LLM (GigaChat + Ollama)
 from llm_provider import (
     DEFAULT_SYSTEM_PROMPT,
-    ENV_PATH as PROJECT_ROOT_ENV,
     generate_gigachat,
+    get_env_write_path,
+    get_ssl_help,
     get_status_info,
+    has_ssl_error,
     is_gigachat_configured,
     warmup_gigachat,
 )
 
 # Настраиваем логгер
 logger = setup_logger(__name__)
+
+# ============================================
+# ГЛОБАЛЬНЫЙ ПЕРЕХВАТ ИСКЛЮЧЕНИЙ
+# ============================================
+# Раньше необработанное исключение в фоновом потоке убивало программу молча:
+# окно исчезало, в логе оставалась одна строка «Программа завершена».
+# Теперь любая такая ошибка попадает в лог с полным трейсбеком.
+
+
+def _excepthook(exc_type, exc_value, exc_tb) -> None:
+    """Пишет необработанные исключения в лог и в stderr."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+
+    try:
+        logger.critical(
+            "НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ", exc_info=(exc_type, exc_value, exc_tb)
+        )
+    except Exception:
+        pass
+
+    print("НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ:", file=sys.stderr)
+    traceback.print_exception(exc_type, exc_value, exc_tb)
+
+
+def _thread_excepthook(args) -> None:
+    """То же самое для фоновых потоков (threading.excepthook)."""
+    _excepthook(args.exc_type, args.exc_value, args.exc_traceback)
+
+
+sys.excepthook = _excepthook
+try:
+    threading.excepthook = _thread_excepthook
+except Exception:  # pragma: no cover
+    pass
+
 logger.info("=" * 70)
 logger.info("ЗАПУСК ГЕНЕРАТОРА КП С GIGACHAT")
 logger.info("=" * 70)
+logger.info(
+    "Режим запуска: %s | Python %s",
+    "собранный EXE" if getattr(sys, "frozen", False) else "исходники",
+    sys.version.split()[0],
+)
+logger.info("Корень проекта: %s", PROJECT_ROOT)
 
 # ============================================
 # КОНФИГУРАЦИЯ ГЕНЕРАЦИИ (параметры под скорость)
@@ -552,6 +599,8 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
 
         def finish():
             _set_busy(False, "")
+            # Плашку SSL обновляем в главном потоке: фон менять виджеты не может
+            update_ssl_banner()
             on_done(text, error)
 
         _dispatch_to_ui(finish)
@@ -618,8 +667,35 @@ def copy_to_clipboard():
     generate_text_async(on_done)
 
 
+def _documents_dir() -> str:
+    """
+    Возвращает папку для сохранения Word-файлов.
+
+    Обычно это рабочий стол. Но его может не быть: OneDrive перенёс папку,
+    профиль ограничен, или система без рабочего стола. Раньше в этом случае
+    сохранение падало с FileNotFoundError — теперь есть надёжный запасной
+    вариант (папка «Документы», затем домашняя папка).
+    """
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Desktop"),
+        os.path.join(home, "OneDrive", "Desktop"),
+        os.path.join(home, "Рабочий стол"),
+        os.path.join(home, "Documents"),
+        os.path.join(home, "Документы"),
+        home,
+    ]
+    for path in candidates:
+        try:
+            if os.path.isdir(path):
+                return path
+        except OSError:
+            continue
+    return home
+
+
 def _save_docx(text: str, filename: str) -> str:
-    """Создаёт Word-файл с текстом КП на рабочем столе."""
+    """Создаёт Word-файл с текстом КП в доступной папке пользователя."""
     doc = Document()
     title = doc.add_heading("КОММЕРЧЕСКОЕ ПРЕДЛОЖЕНИЕ", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -632,8 +708,16 @@ def _save_docx(text: str, filename: str) -> str:
         if line.strip():
             doc.add_paragraph(line)
 
-    filepath = os.path.join(os.path.expanduser("~"), "Desktop", filename)
-    doc.save(filepath)
+    target_dir = _documents_dir()
+    filepath = os.path.join(target_dir, filename)
+    try:
+        doc.save(filepath)
+    except Exception:
+        # Папка оказалась недоступна на запись — сохраняем рядом с программой
+        filepath = os.path.join(PROJECT_ROOT, filename)
+        logger.warning("Не удалось сохранить в %s — сохраняю в %s", target_dir, filepath)
+        doc.save(filepath)
+
     return filepath
 
 
@@ -645,10 +729,8 @@ def save_to_word():
         try:
             region = get_current_region()
             filename = f"КП_{region}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-            _save_docx(text, filename)
-            messagebox.showinfo(
-                "Готово!", f"✅ Word-файл создан на рабочем столе!\n\n{filename}"
-            )
+            path = _save_docx(text, filename)
+            messagebox.showinfo("Готово!", f"✅ Word-файл создан:\n\n{path}")
         except Exception as e:
             logger.error("Ошибка сохранения Word: %s", e)
             messagebox.showerror("Ошибка", f"❌ {e}")
@@ -673,8 +755,7 @@ def save_multiple_variants():
                     f"КП_{region}_вариант_{i+1}_"
                     f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
                 )
-                _save_docx(text, filename)
-                saved_files.append(filename)
+                saved_files.append(_save_docx(text, filename))
         except Exception as e:
             logger.error("Ошибка создания вариантов: %s", e)
             window.after(
@@ -688,8 +769,11 @@ def save_multiple_variants():
 
         def finish():
             _set_busy(False, "")
+            # Показываем реальную папку: рабочий стол есть не на каждой машине
+            folder = os.path.dirname(saved_files[0]) if saved_files else ""
             messagebox.showinfo(
-                "Готово!", f"✅ {len(saved_files)} файла созданы на рабочем столе!"
+                "Готово!",
+                f"✅ Создано файлов: {len(saved_files)}\n\nПапка:\n{folder}",
             )
 
         window.after(0, finish)
@@ -805,12 +889,142 @@ def show_gigachat_help():
     messagebox.showinfo(
         "Справка GigaChat",
         "🔑 Ключ: developers.sber.ru → Личный кабинет → Настройки → Authorization Key\n\n"
-        "Ключ хранится ТОЛЬКО в файле .env в корне проекта и никогда не попадает в Git.\n\n"
-        "🌐 Если в логах ошибка SSL (certificate verify failed), укажите в .env\n"
-        "путь к корневому сертификату Минцифры:\n"
-        "GIGACHAT_CA_BUNDLE_FILE=C:\\certs\\russian_trusted_root_ca.cer\n\n"
-        "Скачать: https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer",
+        f"Ключ хранится ТОЛЬКО в файле .env:\n{get_env_write_path()}\n"
+        "и никогда не попадает в Git.\n\n"
+        "🌐 Если в логах ошибка SSL (certificate verify failed) — нажмите\n"
+        "кнопку «⚠️ SSL» на главном окне: там пошаговая инструкция.",
     )
+
+
+def show_ssl_help():
+    """
+    Инструкция «Как исправить» для SSL-ошибки.
+
+    Текст берётся из llm_provider.get_ssl_help(), чтобы лог и интерфейс
+    не расходились. Окно с прокруткой: инструкция длинная.
+    """
+    dialog = tk.Toplevel(window)
+    dialog.title("⚠️ SSL: как исправить")
+    dialog.configure(bg=BG_COLOR)
+    dialog.transient(window)
+
+    tk.Label(
+        dialog,
+        text="⚠️ Ошибка проверки SSL-сертификата",
+        font=("Arial", 12, "bold"),
+        fg="#c62828",
+        bg=BG_COLOR,
+    ).pack(pady=(15, 5))
+
+    text = tk.Text(
+        dialog, width=84, height=20, wrap="word", font=("Consolas", 9), bg="white"
+    )
+    text.pack(padx=15, pady=5, fill="both", expand=True)
+    text.insert("1.0", get_ssl_help())
+    text.config(state="disabled")
+
+    def open_download():
+        """Открывает страницу с сертификатом в браузере по умолчанию."""
+        url = "https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer"
+        try:
+            import webbrowser
+
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showinfo("Ссылка", f"Откройте вручную:\n\n{url}")
+            logger.warning("Не удалось открыть браузер: %s", e)
+
+    buttons = tk.Frame(dialog, bg=BG_COLOR)
+    buttons.pack(pady=10)
+
+    tk.Button(
+        buttons,
+        text="⬇️ Открыть страницу сертификата",
+        font=("Arial", 9, "bold"),
+        bg="#2196F3",
+        fg="white",
+        padx=12,
+        pady=5,
+        cursor="hand2",
+        command=open_download,
+    ).pack(side="left", padx=5)
+
+    tk.Button(
+        buttons,
+        text="Закрыть",
+        font=("Arial", 9),
+        bg="#9E9E9E",
+        fg="white",
+        padx=12,
+        pady=5,
+        cursor="hand2",
+        command=dialog.destroy,
+    ).pack(side="left", padx=5)
+
+    text.see("1.0")
+    dialog.bind("<Escape>", lambda event: dialog.destroy())
+
+
+def show_key_warning():
+    """
+    Понятное объяснение, что делать без ключа.
+
+    Программа при этом полностью работоспособна: текст КП строится по
+    шаблонам, кнопки копирования и Word работают.
+    """
+    messagebox.showwarning(
+        "GigaChat не настроен",
+        "⚠️ Ключ GigaChat не задан.\n\n"
+        "Сейчас текст коммерческого предложения собирается по шаблонам —\n"
+        "программа работает, но без ИИ.\n\n"
+        "Чтобы включить ИИ:\n"
+        "1. Нажмите кнопку 🔑 на главном окне\n"
+        "2. Вставьте Authorization Key из личного кабинета developers.sber.ru\n"
+        "3. Нажмите «Сохранить»\n\n"
+        f"Ключ сохранится в файл:\n{get_env_write_path()}",
+    )
+
+
+def show_diagnostics():
+    """
+    Кнопка «Диагностика»: показывает, что программа реально видит.
+
+    Специально выведена в интерфейс: при проблемах запуска пользователю
+    не нужно искать логи — видно, какой .env найден, есть ли ключ и
+    подхватился ли сертификат Минцифры.
+    """
+    try:
+        info = get_status_info()
+    except Exception as e:
+        messagebox.showerror("Диагностика", f"❌ Не удалось собрать сведения:\n{e}")
+        return
+
+    lines = [
+        f"Режим: {'собранный EXE' if info.get('frozen') else 'исходники'}",
+        "",
+        "🔑 КЛЮЧ GIGACHAT",
+        f"  настроен: {info['gigachat_configured']}",
+        f"  credentials: {info['gigachat_credentials']}",
+        f"  модель: {info['gigachat_model']}",
+        f"  .env: {info['env_path']}",
+        f"  .env существует: {info['env_exists']}",
+        "",
+        "📄 ГДЕ ИСКАЛИ .env",
+    ]
+    lines += [f"  {p}" for p in info.get("env_found_paths", [])]
+    lines += [
+        "",
+        "🌐 SSL",
+        f"  сертификат задан: {info.get('ca_bundle') or '— нет —'}",
+        f"  найден в проекте: {info.get('ca_bundle_found') or 'нет'}",
+        f"  ожидаемый путь: {info.get('ca_bundle_expected')}",
+        f"  SSL-ошибка: {'да' if info.get('ssl_error') else 'нет'}",
+        "",
+        "📝 ЛОГИ",
+        f"  {getattr(sys.modules.get('logger_config'), 'LOG_FILE', 'см. папку logs')}",
+    ]
+
+    messagebox.showinfo("Диагностика", "\n".join(lines))
 
 
 # ============================================
@@ -822,14 +1036,21 @@ def _save_credentials_to_env(key: str) -> str:
     """
     Записывает ключ в .env, не затирая остальные настройки.
 
+    Путь выбирается с учётом режима запуска: для собранного .exe это файл
+    РЯДОМ С .EXE (внутрь архива PyInstaller писать нельзя), для исходников —
+    корень проекта.
+
     Файл создаётся при необходимости. Старая строка с ключом удаляется,
     новая добавляется в конец. Возвращает путь к .env.
     """
-    env_path = PROJECT_ROOT_ENV
+    env_path = get_env_write_path()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+
     lines = []
 
     if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
+        # utf-8-sig: файл мог быть создан Блокнотом с BOM
+        with open(env_path, "r", encoding="utf-8-sig") as f:
             lines = [
                 line.rstrip("\n")
                 for line in f
@@ -844,13 +1065,17 @@ def _save_credentials_to_env(key: str) -> str:
             "GIGACHAT_VERIFY_SSL_CERTS=true",
             "GIGACHAT_CA_BUNDLE_FILE=",
         ]
+    elif not any(line.startswith("GIGACHAT_CA_BUNDLE_FILE") for line in lines):
+        # Сохраняем настройку SSL, даже если её не было в старом файле
+        lines.append("GIGACHAT_CA_BUNDLE_FILE=")
 
     lines.append(f"GIGACHAT_CREDENTIALS={key}")
 
+    # encoding="utf-8" без BOM: так файл читают и dotenv, и сам генератор
     with open(env_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    return env_path
+    return str(env_path)
 
 
 def enter_api_key():
@@ -992,6 +1217,67 @@ def enter_api_key():
 
 
 # ============================================
+# ЗАКРЫТИЕ ОКНА И ГЛАВНЫЙ ЦИКЛ
+# ============================================
+# Определяем эти функции ДО построения интерфейса: обработчик закрытия
+# подключается к окну и к кнопке «ВЫХОД» в момент их создания.
+# Явный обработчик нужен, чтобы закрытие всегда проходило через destroy()
+# и в лог попадала понятная причина, а не молчаливый выход из mainloop().
+# Раньше в логе оставалась одна строка «Программа завершена» без объяснения —
+# именно это и выглядело как «программа закрылась сама».
+
+_window_closed = {"value": False}
+
+
+def on_closing() -> None:
+    """Корректно закрывает окно и пишет причину в лог."""
+    if _window_closed["value"]:
+        return
+    _window_closed["value"] = True
+    logger.info("Закрытие окна по команде пользователя (крестик/ВЫХОД)")
+    try:
+        window.destroy()
+    except Exception as exc:
+        logger.warning("Ошибка при закрытии окна: %s", exc)
+
+
+def on_exit_button() -> None:
+    """Кнопка «ВЫХОД»: тот же путь, что и крестик."""
+    on_closing()
+
+
+def _acquire_single_instance_lock():
+    """
+    Пытается захватить именованный мьютекс Windows.
+
+    Две одновременно запущенные копии писали в один лог-файл и мешали друг
+    другу, а вторая копия могла упасть ещё до появления окна.
+
+    Returns:
+        handle мьютекса или None, если программа уже запущена / не Windows.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, True, "Global\\GeneratorKP_GigaChat")
+        if not handle:
+            return None
+        # ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == 183:
+            kernel32.CloseHandle(handle)
+            return None
+        return handle
+    except Exception as exc:
+        logger.debug("Проверка единственного экземпляра недоступна: %s", exc)
+        return None
+
+
+# ============================================
 # ГРАФИЧЕСКИЙ ИНТЕРФЕЙС
 # ============================================
 
@@ -1028,6 +1314,59 @@ status_label = tk.Label(
     bg=BG_COLOR,
 )
 status_label.pack()
+
+# Если ключа нет — сразу говорим, что делать (а не просто красная строка)
+if not GIGACHAT_READY:
+    key_warning_label = tk.Label(
+        header_frame,
+        text="⚠️ Ключ GigaChat не задан. Нажмите 🔑 для ввода",
+        font=("Arial", 9, "bold"),
+        fg="#b71c1c",
+        bg="#ffe0e0",
+        padx=8,
+        pady=3,
+    )
+    key_warning_label.pack(pady=3)
+
+# Плашка про SSL: показывается, когда запрос упал по сертификату
+ssl_banner = tk.Frame(window, bg="#ffcdd2")
+ssl_label = tk.Label(
+    ssl_banner,
+    text="⚠️ SSL: не удалось проверить сертификат GigaChat",
+    font=("Arial", 9, "bold"),
+    fg="#b71c1c",
+    bg="#ffcdd2",
+)
+ssl_label.pack(side="left", padx=8, pady=3)
+tk.Button(
+    ssl_banner,
+    text="Как исправить",
+    font=("Arial", 8, "bold"),
+    bg="#c62828",
+    fg="white",
+    padx=8,
+    pady=1,
+    cursor="hand2",
+    command=show_ssl_help,
+).pack(side="left", padx=4, pady=3)
+
+
+def update_ssl_banner() -> None:
+    """
+    Показывает красную плашку, если последний запрос упал по SSL.
+
+    Вызывается из главного потока после каждой генерации: менять виджеты
+    из фонового потока в Tkinter нельзя.
+    """
+    try:
+        if has_ssl_error():
+            if not ssl_banner.winfo_ismapped():
+                ssl_banner.pack(fill="x", padx=20, pady=4)
+        else:
+            if ssl_banner.winfo_ismapped():
+                ssl_banner.pack_forget()
+    except Exception as exc:
+        logger.debug("Не удалось обновить SSL-плашку: %s", exc)
 
 ai_control_frame = tk.Frame(window, bg=BG_COLOR)
 ai_control_frame.pack(pady=5)
@@ -1084,6 +1423,18 @@ tk.Button(
     cursor="hand2",
     command=clear_cache,
 ).pack(side="left", padx=5)
+
+tk.Button(
+    ai_control_frame,
+    text="📋 Диагностика",
+    font=("Arial", 9),
+    bg="#455A64",
+    fg="white",
+    padx=8,
+    pady=3,
+    cursor="hand2",
+    command=show_diagnostics,
+).pack(side="left", padx=2)
 
 tk.Button(
     ai_control_frame,
@@ -1309,16 +1660,56 @@ tk.Button(
     pady=5,
     width=15,
     cursor="hand2",
-    command=window.quit,
+    command=on_exit_button,
 ).pack(pady=10)
 
 logger.info("Интерфейс загружен")
+
+# Обработчик крестика подключаем сразу после создания окна
+window.protocol("WM_DELETE_WINDOW", on_closing)
 
 # Первый предпросмотр и прогрев авторизации — в фоне, окно открывается сразу
 window.after(100, refresh_preview_async)
 
 if GIGACHAT_READY:
     threading.Thread(target=warmup_gigachat, name="gigachat-startup-warmup", daemon=True).start()
+else:
+    logger.warning(
+        "Ключ GigaChat не задан — используется шаблонный текст. "
+        "Введите ключ кнопкой «🔑 Ключ» или в файле .env"
+    )
 
-window.mainloop()
+# ============================================
+# ГЛАВНЫЙ ЦИКЛ
+# ============================================
+
+_mutex_handle = _acquire_single_instance_lock()
+if _mutex_handle is None and os.name == "nt":
+    logger.warning("Похоже, программа уже запущена — работаю вторым экземпляром")
+
+try:
+    window.mainloop()
+except SystemExit as exc:
+    logger.info("Выход по SystemExit: %s", exc)
+except BaseException as exc:
+    # Падение в главном цикле больше не выглядит как «окно мигнуло и исчезло»
+    logger.critical("КРИТИЧЕСКАЯ ОШИБКА в главном цикле", exc_info=True)
+    try:
+        messagebox.showerror(
+            "Критическая ошибка",
+            "❌ Программа столкнулась с ошибкой и будет закрыта.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            f"Подробности записаны в лог:\n{LOG_FILE_HINT}",
+        )
+    except Exception:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+else:
+    # mainloop вернулся нормально — это штатное закрытие окна
+    if not _window_closed["value"]:
+        logger.warning(
+            "Главный цикл завершился БЕЗ команды закрытия окна — "
+            "проверьте, не закрыла ли программу другая программа "
+            "(антивирус, диспетчер задач)"
+        )
+
 logger.info("Программа завершена")

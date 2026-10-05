@@ -113,6 +113,37 @@ def _make_formatter() -> logging.Formatter:
     )
 
 
+class _SafeRotatingFileHandler(RotatingFileHandler):
+    """
+    RotatingFileHandler, который не роняет программу при проблемах с файлом.
+
+    Зачем это нужно:
+      * delay=True откладывает открытие файла до первой записи — значит,
+        папка к этому моменту должна существовать, иначе FileNotFoundError
+        прилетит в момент старта программы;
+      * папку мог удалить или заблокировать антивирус/клинер уже после
+        проверки прав;
+      * ошибка логирования НИКОГДА не должна быть причиной вылета программы
+        (именно так раньше и выглядел «запуск с чёрным окном на секунду»).
+    """
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except Exception:
+            # Ошибку глотаем осознанно: логирование — не критичная функция.
+            # Предотвращаем бесконечный цикл «ошибка при выводе ошибки».
+            self.handleError(record)
+
+    def _open(self):
+        try:
+            # Папка могла исчезнуть после старта — воссоздаём перед записью
+            os.makedirs(os.path.dirname(self.baseFilename), exist_ok=True)
+        except Exception:
+            pass
+        return super()._open()
+
+
 def _make_file_handler(path: str):
     """
     Создаёт обработчик файла лога.
@@ -121,7 +152,7 @@ def _make_file_handler(path: str):
     импорте модуля. Так запуск программы не захватывает файл заранее и
     не мешает другим экземплярам.
     """
-    handler = RotatingFileHandler(
+    handler = _SafeRotatingFileHandler(
         path,
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
