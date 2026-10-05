@@ -10,8 +10,24 @@
   3. Ставит pre-commit hook (защита от утечки ключа GigaChat в Git).
   4. Проверяет, что исходники на месте и компилируются.
   5. Собирает EXE через spec-файлы (а не набором ключей в командной строке).
-  6. Копирует готовые .exe на рабочий стол.
-  7. Проверяет, что .exe реально запускается (пробный запуск с таймаутом).
+  6. Копирует готовые ПАПКИ сборки на рабочий стол.
+  7. Проверяет, что программа реально запускается (пробный запуск с таймаутом).
+
+ВАЖНО ПРО РЕЖИМ СБОРКИ (ONEDIR):
+  Программа собирается в режиме onedir, а не onefile. На выходе получается
+  не один .exe, а ПАПКА dist\\<имя>\\ с загрузчиком и подпапкой _internal\\.
+
+  Причина: onefile-сборка при каждом запуске распаковывает всё содержимое
+  во временную папку %TEMP%\\_MEIxxxxx\\. Антивирусы (Kaspersky, Pro32)
+  блокируют эту распаковку, и программа падает с ошибкой
+  «Could not create temporary directory!» ещё до появления окна.
+  Исключения антивируса на папку проекта не помогают — распаковка идёт
+  в %TEMP%, а не в проект.
+
+  В режиме onedir распаковки нет: зависимости читаются из _internal\\
+  рядом с .exe. Поэтому установщик теперь работает с папками, а не с
+  отдельными файлами. Переносить программу на другой компьютер нужно
+  ТОЛЬКО целой папкой — один .exe без _internal\\ не заработает.
 
 Запуск:
     python scripts/setup.py                # полная установка и сборка
@@ -69,10 +85,22 @@ TEMPLATE_SPEC = SCRIPTS_DIR / "generator_kp_template.spec"
 GIGACHAT_EXE = "Генератор_КП_GigaChat.exe"
 TEMPLATE_EXE = "Генератор_КП_Шаблон.exe"
 
+# Сборка идёт в режиме onedir: результат — ПАПКА, внутри которой лежат
+# загрузчик .exe и подпапка _internal\ с зависимостями.
+GIGACHAT_BUNDLE = "Генератор_КП_GigaChat"
+TEMPLATE_BUNDLE = "Генератор_КП_Шаблон"
+
+# Имя подпапки с зависимостями. Задано явно и в spec-файлах
+# (contents_directory="_internal"), чтобы не зависеть от версии PyInstaller.
+CONTENTS_DIR = "_internal"
+
 # Имя, под которым шаблонная версия ложится на рабочий стол.
-# Оставлено прежним: так работает ярлык/привычка пользователя и
-# совместимо со старой сборкой setup.py.
-DESKTOP_TEMPLATE_EXE = "Генератор_КП.exe"
+# Раньше (в режиме onefile) это был одиночный файл «Генератор_КП.exe».
+# Теперь сборка — папка, и переименовывать её в «.exe» нельзя: получится
+# папка с расширением .exe, которая только запутает. Поэтому копия на
+# рабочем столе называется так же, как папка сборки, — и остаётся
+# самодостаточной (внутри есть и .exe, и _internal\).
+DESKTOP_TEMPLATE_NAME = TEMPLATE_BUNDLE
 
 MIN_PYTHON = (3, 9)
 
@@ -102,19 +130,59 @@ def run(cmd, cwd=None, check=False):
         return 127
 
 
-def desktop_dir() -> Path:
+def desktop_dir(override: str = None) -> Path:
     """
-    Возвращает папку рабочего стола.
+    Возвращает папку, куда класть копию сборки.
 
-    Рабочего стола может не быть (OneDrive перенёс папку, ограниченный
-    профиль) — тогда используем «Документы», затем домашнюю папку.
+    По умолчанию — рабочий стол. Его может не быть (OneDrive перенёс папку,
+    ограниченный профиль) — тогда используем «Документы», затем домашнюю
+    папку.
+
+    override — путь из ключа --desktop-dir; нужен, чтобы положить копию
+    в выбранное место (например, на флешку) или в тестовую папку.
     """
+    if override:
+        path = Path(override).expanduser()
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            print(f"  ⚠️  Не удалось создать папку {path}: {exc}")
+        return path
+
     home = Path(os.path.expanduser("~"))
     for name in ("Desktop", "OneDrive/Desktop", "Рабочий стол", "Documents", "Документы"):
         candidate = home / name
         if candidate.is_dir():
             return candidate
     return home
+
+
+def dir_size_bytes(path: Path) -> int:
+    """
+    Считает суммарный размер папки со всеми вложенными файлами.
+
+    Нужно потому, что в режиме onedir результат сборки — папка, а не файл:
+    «вес» программы складывается из загрузчика .exe и содержимого _internal\\.
+    Отдельные файлы могут быть заняты антивирусом или удалены параллельно,
+    поэтому ошибки доступа молча пропускаем, а не роняем установщик.
+    """
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            try:
+                if item.is_file():
+                    total += item.stat().st_size
+            except OSError:
+                # Файл занят или исчез между обходом и stat — не критично
+                pass
+    except OSError:
+        pass
+    return total
+
+
+def mb(size_bytes: int) -> float:
+    """Переводит байты в мегабайты."""
+    return size_bytes / (1024 * 1024)
 
 
 # ============================================
@@ -280,46 +348,52 @@ def check_sources() -> bool:
 # ============================================
 
 
-def free_stale_output(exe_name: str) -> None:
+def free_stale_output(bundle_name: str) -> None:
     """
-    Освобождает путь dist/<exe_name> перед сборкой.
+    Освобождает путь dist/<bundle_name>/ перед сборкой (режим onedir).
 
-    PyInstaller дописывает данные в уже созданный .exe, поэтому существующий
-    файл нужно убрать. Иногда обычное удаление невозможно: файл держит
-    антивирус (Kaspersky и подобные сканируют свежесобранный .exe) или
-    остался «хвост» от прерванной сборки. Тогда файл ПЕРЕИМЕНОВЫВАЕТСЯ —
-    это отдельная операция, которая в такой ситуации проходит, после чего
-    имя снова свободно.
+    В onedir результат сборки — ПАПКА, поэтому убирать нужно её целиком:
+    PyInstaller дописывает файлы в уже существующий каталог, и остатки
+    прошлой сборки ломают результат с PermissionError.
+
+    Иногда обычное удаление невозможно: файлы внутри держит антивирус
+    (Kaspersky и подобные сканируют свежесобранные .dll/.exe) или остался
+    «хвост» от прерванной сборки. Тогда папка ПЕРЕИМЕНОВЫВАЕТСЯ — это
+    отдельная операция, которая в такой ситуации обычно проходит, после
+    чего имя снова свободно.
 
     Никакие данные пользователя здесь не трогаются: только наш dist/.
     """
-    target = DIST_DIR / exe_name
+    target = DIST_DIR / bundle_name
     if not target.exists():
         return
 
     try:
-        target.unlink()
-        print(f"  ♻️  Удалён старый файл: {exe_name}")
+        shutil.rmtree(target)
+        print(f"  ♻️  Удалена старая папка сборки: {bundle_name}\\")
         return
     except Exception as exc:
-        print(f"  ⚠️  Не удалось удалить {exe_name}: {exc}")
+        print(f"  ⚠️  Не удалось удалить папку {bundle_name}\\: {exc}")
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    stale = target.with_name(f"{target.stem}_STALE_{stamp}{target.suffix}")
+    stale = target.with_name(f"{target.name}_STALE_{stamp}")
     try:
         target.rename(stale)
-        print(f"  ♻️  Файл был занят — отложен как {stale.name}")
+        print(f"  ♻️  Папка была занята — отложена как {stale.name}\\")
     except Exception as exc:
         print(f"  ❌ Не удалось освободить {target}: {exc}")
         print("     Закройте программу (если запущена) и повторите сборку.")
 
 
 def cleanup_old_stale() -> None:
-    """Убирает ранее отложенные файлы *_STALE_*, чтобы dist не разрастался."""
+    """Убирает ранее отложенные файлы и папки *_STALE_*, чтобы dist не разрастался."""
     try:
         for item in DIST_DIR.glob("*_STALE_*"):
             try:
-                item.unlink()
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
             except Exception:
                 # Занятый файл не мешает сборке — оставляем как есть
                 pass
@@ -327,10 +401,11 @@ def cleanup_old_stale() -> None:
         pass
 
 
-def build(spec: Path, label: str, exe_name: str) -> bool:
-    """Собирает EXE по spec-файлу."""
+def build(spec: Path, label: str, bundle_name: str, exe_name: str) -> bool:
+    """Собирает папку сборки (режим onedir) по spec-файлу."""
     print(f"\n  📦 {label}")
     print(f"     spec: {spec.name}")
+    print(f"     режим: onedir (папка {bundle_name}\\)")
 
     if not spec.is_file():
         print(f"     ❌ spec-файл не найден: {spec}")
@@ -338,10 +413,10 @@ def build(spec: Path, label: str, exe_name: str) -> bool:
 
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_old_stale()
-    # Освобождаем целевой файл: PyInstaller ДОПИСЫВАЕТ данные в уже готовый
-    # .exe, поэтому занятый файл (антивирус, запущенная копия программы,
+    # Освобождаем целевую папку: PyInstaller дописывает файлы в уже готовый
+    # каталог, поэтому занятая папка (антивирус, запущенная копия программы,
     # остаток прерванной сборки) ломает сборку с PermissionError.
-    free_stale_output(exe_name)
+    free_stale_output(bundle_name)
 
     # Вызываем PyInstaller как модуль: так не зависим от того, попал ли
     # pyinstaller.exe в PATH (частая проблема на Windows).
@@ -360,16 +435,27 @@ def build(spec: Path, label: str, exe_name: str) -> bool:
         ]
     )
 
-    final = DIST_DIR / exe_name
-    if code != 0 or not final.is_file():
+    final_dir = DIST_DIR / bundle_name
+    final_exe = final_dir / exe_name
+    # Проверяем именно папку с загрузчиком внутри: если PyInstaller по
+    # ошибке соберёт onefile, папки не будет и проверка это поймает.
+    if code != 0 or not final_exe.is_file():
         print(f"     ❌ Сборка не удалась (код {code})")
-        print("     Если в ошибке PermissionError — файл держит антивирус.")
+        if final_dir.is_dir() and not final_exe.is_file():
+            print(f"     Папка {bundle_name}\\ есть, но внутри нет {exe_name}.")
+        print("     Если в ошибке PermissionError — файлы держит антивирус.")
         print("     Добавьте папку проекта в его исключения и повторите сборку.")
-        free_stale_output(exe_name)
+        free_stale_output(bundle_name)
         return False
 
-    size_mb = final.stat().st_size / (1024 * 1024)
-    print(f"     ✅ Сборка завершена: {final.name} ({size_mb:.1f} МБ)")
+    total = dir_size_bytes(final_dir)
+    internal = final_dir / CONTENTS_DIR
+    internal_mb = mb(dir_size_bytes(internal)) if internal.is_dir() else 0.0
+    print(f"     ✅ Сборка завершена: {final_dir}")
+    print(f"        загрузчик {exe_name}: {mb(final_exe.stat().st_size):.1f} МБ")
+    if internal.is_dir():
+        print(f"        папка {CONTENTS_DIR}\\: {internal_mb:.1f} МБ")
+    print(f"        всего папка: {mb(total):.1f} МБ")
     return True
 
 
@@ -378,48 +464,81 @@ def build(spec: Path, label: str, exe_name: str) -> bool:
 # ============================================
 
 
-def copy_to_desktop(exe_name: str, desktop_name: str = None) -> bool:
-    source = DIST_DIR / exe_name
-    if not source.is_file():
-        print(f"  ❌ Нет файла для копирования: {source}")
+def copy_to_desktop(
+    bundle_name: str,
+    exe_name: str,
+    desktop_name: str = None,
+    dest_root: str = None,
+) -> bool:
+    """
+    Копирует на рабочий стол ВСЮ папку сборки (режим onedir).
+
+    Копировать один .exe нельзя: он не заработает без папки _internal\\
+    (там Python и все библиотеки). Поэтому переносится каталог целиком,
+    а внутрь него докладываются .env.example и config\\ — программа ищет
+    их рядом с .exe, то есть уже внутри скопированной папки.
+
+    Так папка на рабочем столе получается самодостаточной: её можно
+    скопировать на флешку или отправить архивом и запустить на другой
+    машине без Python.
+    """
+    source_dir = DIST_DIR / bundle_name
+    source_exe = source_dir / exe_name
+
+    if not source_dir.is_dir():
+        print(f"  ❌ Нет папки для копирования: {source_dir}")
+        return False
+    if not source_exe.is_file():
+        print(f"  ❌ В папке нет {exe_name}: {source_exe}")
         return False
 
-    target_dir = desktop_dir()
-    target = target_dir / (desktop_name or exe_name)
+    target_root = desktop_dir(dest_root)
+    target = target_root / (desktop_name or bundle_name)
+
+    # Старую копию убираем: copytree не умеет писать поверх существующей
+    # папки, а смешивать две версии сборки в одной папке нельзя.
+    if target.exists():
+        try:
+            shutil.rmtree(target)
+            print(f"  ♻️  Старая копия на рабочем столе удалена: {target.name}\\")
+        except Exception as exc:
+            print(f"  ❌ Не удалось удалить старую копию {target}: {exc}")
+            print("     Возможно, программа запущена — закройте её и повторите.")
+            return False
 
     try:
-        shutil.copy2(source, target)
-    except PermissionError:
-        print(f"  ❌ Файл занят (возможно, программа запущена): {target}")
+        shutil.copytree(source_dir, target)
+    except PermissionError as exc:
+        print(f"  ❌ Не удалось скопировать (файлы заняты): {exc}")
         return False
     except Exception as exc:
-        print(f"  ❌ Не удалось скопировать: {exc}")
+        print(f"  ❌ Не удалось скопировать папку: {exc}")
         return False
 
-    size_mb = source.stat().st_size / (1024 * 1024)
-    print(f"  ✅ {target}  ({size_mb:.1f} МБ)")
-
-    # Рядом с EXE кладём образец .env: пользователь заполнит его ключом.
-    # Именно так файл попадёт в папку, откуда программа его читает.
+    # ---------- Докладываем образцы внутрь папки ----------
+    # Программа читает .env и config\ рядом с .exe (sys.executable),
+    # а .exe лежит в корне папки сборки — значит, файлы кладём туда же.
     env_example = PROJECT_ROOT / ".env.example"
     if env_example.is_file():
         try:
-            shutil.copy2(env_example, target_dir / ".env.example")
-            print("     рядом положен .env.example (образец для ключа)")
+            shutil.copy2(env_example, target / ".env.example")
+            print("     внутрь папки положен .env.example (образец для ключа)")
         except Exception as exc:
             print(f"     ⚠️  .env.example не скопирован: {exc}")
 
-    # Папка config рядом с .exe — чтобы сертификат можно было просто положить
     for name in ("russian_trusted_root_ca.cer", "settings.example.json"):
         item = CONFIG_DIR / name
         if item.is_file():
             try:
-                (target_dir / "config").mkdir(exist_ok=True)
-                shutil.copy2(item, target_dir / "config" / name)
-                print(f"     рядом положен config/{name}")
+                (target / "config").mkdir(exist_ok=True)
+                shutil.copy2(item, target / "config" / name)
+                print(f"     внутрь папки положен config/{name}")
             except Exception as exc:
                 print(f"     ⚠️  config/{name} не скопирован: {exc}")
 
+    total = dir_size_bytes(target)
+    print(f"  ✅ {target}\\  ({mb(total):.1f} МБ)")
+    print(f"     запускать: {target / exe_name}")
     return True
 
 
@@ -435,8 +554,16 @@ def smoke_test(exe_path: Path, timeout: float = 45.0) -> bool:
     Как это проверяется без ручного наблюдения за окном:
       * программа запускается в отдельном процессе;
       * ошибка запуска (например, падение логгера) видна по коду возврата;
-      * успешный старт подтверждается появлением свежего файла лога рядом
-        с .exe — значит модуль дошёл до настройки логирования.
+      * успешный старт подтверждается СВЕЖЕЙ записью в логе рядом с .exe —
+        значит модуль дошёл до настройки логирования.
+
+    Важно: в режиме onedir .exe лежит внутри папки сборки, поэтому лог
+    появляется в dist/<папка сборки>/logs/, а не в dist/logs/. Путь
+    вычисляется от самого .exe, так что за этим следить не нужно.
+
+    «Свежесть» лога проверяется по времени изменения файла, а не по факту
+    его существования: лог от прошлого запуска не должен приниматься за
+    доказательство старта.
 
     Returns:
         True, если EXE запустился.
@@ -448,9 +575,20 @@ def smoke_test(exe_path: Path, timeout: float = 45.0) -> bool:
         return False
 
     log_dir = exe_path.parent / "logs"
-    before = set(log_dir.glob("generator_*.log")) if log_dir.is_dir() else set()
+    if not log_dir.is_dir():
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+    def newest_log_mtime() -> float:
+        """Время последнего изменения самого свежего лога (0 — логов нет)."""
+        try:
+            stamps = [p.stat().st_mtime for p in log_dir.glob("generator_*.log")]
+        except OSError:
+            return 0.0
+        return max(stamps) if stamps else 0.0
 
     started = time.time()
+    mtime_before = newest_log_mtime()
+
     try:
         proc = subprocess.Popen(
             [str(exe_path)],
@@ -462,17 +600,16 @@ def smoke_test(exe_path: Path, timeout: float = 45.0) -> bool:
         print(f"     ❌ Не удалось запустить: {exc}")
         return False
 
-    # Ждём либо появления лога, либо завершения процесса
-    appearing = False
+    # Ждём либо свежей записи в логе, либо завершения процесса
+    logging_started = False
     while time.time() - started < timeout:
         if proc.poll() is not None:
             # Процесс завершился сам — для GUI это признак проблемы
             print(f"     ❌ Процесс завершился сам, код {proc.returncode}")
             return False
 
-        now = set(log_dir.glob("generator_*.log")) if log_dir.is_dir() else set()
-        if now - before or (log_dir.is_dir() and any(log_dir.iterdir())):
-            appearing = True
+        if newest_log_mtime() > mtime_before:
+            logging_started = True
             break
 
         time.sleep(0.5)
@@ -489,13 +626,13 @@ def smoke_test(exe_path: Path, timeout: float = 45.0) -> bool:
     except Exception:
         pass
 
-    if appearing:
+    if logging_started:
         print(f"     ✅ Программа стартовала за {elapsed:.1f} с и пишет логи")
         print(f"        ({log_dir})")
         return True
 
     print(f"     ⚠️  Процесс запустился и не упал за {elapsed:.0f} с,")
-    print("        но файл лога не появился. Проверьте запуск вручную.")
+    print("        но свежей записи в логе нет. Проверьте запуск вручную.")
     return True
 
 
@@ -513,10 +650,15 @@ def main() -> int:
         "--skip-template", action="store_true", help="не собирать шаблонную версию"
     )
     parser.add_argument(
-        "--no-desktop", action="store_true", help="не копировать EXE на рабочий стол"
+        "--no-desktop", action="store_true", help="не копировать папки сборки на рабочий стол"
     )
     parser.add_argument(
         "--no-test", action="store_true", help="не выполнять пробный запуск EXE"
+    )
+    parser.add_argument(
+        "--desktop-dir",
+        default=None,
+        help="куда класть копию сборки (по умолчанию — рабочий стол)",
     )
     args = parser.parse_args()
 
@@ -541,53 +683,66 @@ def main() -> int:
         print("\n  ❌ Исходники не годятся для сборки.")
         return 1
 
-    step(5, "Сборка EXE")
+    step(5, "Сборка в режиме onedir (папки, а не одиночные файлы)")
+    # Каждый элемент: (папка сборки, .exe внутри неё, имя копии на столе)
     built = []
 
-    if build(GIGACHAT_SPEC, "Версия с ИИ (GigaChat)", GIGACHAT_EXE):
-        built.append((GIGACHAT_EXE, GIGACHAT_EXE))
+    if build(GIGACHAT_SPEC, "Версия с ИИ (GigaChat)", GIGACHAT_BUNDLE, GIGACHAT_EXE):
+        built.append((GIGACHAT_BUNDLE, GIGACHAT_EXE, GIGACHAT_BUNDLE))
 
     if not args.skip_template:
-        if build(TEMPLATE_SPEC, "Шаблонная версия (без ИИ)", TEMPLATE_EXE):
-            built.append((TEMPLATE_EXE, DESKTOP_TEMPLATE_EXE))
+        if build(TEMPLATE_SPEC, "Шаблонная версия (без ИИ)", TEMPLATE_BUNDLE, TEMPLATE_EXE):
+            built.append((TEMPLATE_BUNDLE, TEMPLATE_EXE, DESKTOP_TEMPLATE_NAME))
 
     if not built:
-        print("\n  ❌ Ни один EXE не собрался.")
+        print("\n  ❌ Ни одна версия не собралась.")
         return 1
 
     if not args.no_desktop:
-        step(6, "Копирование на рабочий стол")
-        for exe_name, desktop_name in built:
-            copy_to_desktop(exe_name, desktop_name)
+        step(6, "Копирование папок сборки на рабочий стол")
+        for bundle_name, exe_name, desktop_name in built:
+            copy_to_desktop(bundle_name, exe_name, desktop_name, args.desktop_dir)
 
     if not args.no_test:
-        step(7, "Проверка, что EXE запускается")
-        for exe_name, _ in built:
-            smoke_test(DIST_DIR / exe_name)
+        step(7, "Проверка, что программа запускается")
+        for bundle_name, exe_name, _ in built:
+            smoke_test(DIST_DIR / bundle_name / exe_name)
 
     # ---------- Итог ----------
     print()
     hr()
     print("  ✅ ГОТОВО")
     hr()
-    for exe_name, _ in built:
-        path = DIST_DIR / exe_name
-        if path.is_file():
-            size_mb = path.stat().st_size / (1024 * 1024)
-            print(f"  📦 {path}  ({size_mb:.1f} МБ)")
+    for bundle_name, exe_name, _ in built:
+        path = DIST_DIR / bundle_name
+        if path.is_dir():
+            total = dir_size_bytes(path)
+            exe_path = path / exe_name
+            exe_mb = mb(exe_path.stat().st_size) if exe_path.is_file() else 0.0
+            print(f"  📦 {path}\\")
+            print(f"     {exe_name}  ({exe_mb:.1f} МБ)")
+            print(f"     Итого папка: {mb(total):.1f} МБ")
     if not args.no_desktop:
-        print(f"\n  📋 Копии на рабочем столе: {desktop_dir()}")
-        print(f"     {GIGACHAT_EXE}      — с ИИ, нужен ключ GigaChat")
+        print(f"\n  📋 Копии в папке: {desktop_dir(args.desktop_dir)}")
+        print(f"     {GIGACHAT_BUNDLE}\\{GIGACHAT_EXE}")
+        print("        — с ИИ, нужен ключ GigaChat")
         if not args.skip_template:
-            print(f"     {DESKTOP_TEMPLATE_EXE}         — шаблоны, работает без ключа")
+            print(f"     {DESKTOP_TEMPLATE_NAME}\\{TEMPLATE_EXE}")
+            print("        — шаблоны, работает без ключа")
 
     print("\n  📋 Что дальше:")
-    print("     1. Запустите EXE двойным кликом.")
+    print("     1. Запускать нужно .exe ВНУТРИ папки сборки, например:")
+    print(f"        {DIST_DIR / GIGACHAT_BUNDLE / GIGACHAT_EXE}")
+    print("        Один .exe без папки _internal\\ не заработает!")
     print("     2. Нажмите «🔑 Ключ» и вставьте Authorization Key GigaChat.")
     print("        Ключ сохранится в .env РЯДОМ С EXE (в Git он не попадёт).")
     print("     3. Если в логе SSL-ошибка — нажмите «⚠️ SSL» в окне")
     print("        и положите сертификат Минцифры в папку config.")
     print("     4. Кнопка «📋 Диагностика» покажет, какой .env найден.")
+    print("\n  📋 Как перенести на другой компьютер:")
+    print("     Копируйте ВСЮ папку сборки целиком (или упакуйте её в ZIP).")
+    print("     Папку удобно запускать ярлыком: правый клик по .exe →")
+    print("     «Отправить» → «Рабочий стол (создать ярлык)».")
     hr()
 
     return 0

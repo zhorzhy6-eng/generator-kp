@@ -9,10 +9,19 @@
 #  Запуск (из корня проекта):
 #      pyinstaller scripts/generator_kp_template.spec --clean --noconfirm
 #
-#  Результат: dist/Генератор_КП_Шаблон.exe
+#  Результат (режим ONEDIR): папка
+#      dist/Генератор_КП_Шаблон/
+#      ├── Генератор_КП_Шаблон.exe   — загрузчик
+#      ├── _internal/                — Python и все библиотеки
+#      └── config/
+#
+#  Почему НЕ onefile — см. подробный комментарий в generator_kp.spec:
+#  onefile распаковывается в %TEMP%\_MEIxxxxx\ при каждом запуске, и
+#  антивирус (Kaspersky, Pro32) блокирует эту распаковку. В onedir
+#  распаковки нет, зависимости читаются из _internal\ рядом с .exe.
 #
 #  GigaChat и python-dotenv здесь НЕ нужны — поэтому они исключены:
-#  файл получается заметно меньше.
+#  папка получается заметно меньше.
 # ============================================================
 
 import os
@@ -98,16 +107,15 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    # ONEDIR: библиотеки и данные уходят в COLLECT() ниже, в _internal\.
+    # exclude_binaries=True — именно этот флаг переключает сборку в onedir.
+    exclude_binaries=True,
     name="Генератор_КП_Шаблон",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -115,4 +123,16 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=icon_path if has_icon else None,
+)
+
+# ---------- Сборка папки (ONEDIR) ----------
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="Генератор_КП_Шаблон",
+    contents_directory="_internal",
 )

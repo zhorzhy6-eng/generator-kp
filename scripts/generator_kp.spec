@@ -8,10 +8,28 @@
 #  Запуск (из корня проекта):
 #      pyinstaller scripts/generator_kp.spec --clean --noconfirm
 #
-#  Результат: dist/Генератор_КП_GigaChat.exe
+#  Результат (режим ONEDIR): папка
+#      dist/Генератор_КП_GigaChat/
+#      ├── Генератор_КП_GigaChat.exe   — загрузчик (~5 МБ)
+#      ├── _internal/                  — Python и все библиотеки
+#      ├── .env.example
+#      └── config/
+#
+#  Почему НЕ onefile:
+#      onefile-сборка при КАЖДОМ запуске распаковывает всё содержимое во
+#      временную папку %TEMP%\_MEIxxxxx\. Kaspersky и Pro32 блокируют эту
+#      распаковку, и программа падает с «Could not create temporary
+#      directory!» ещё до появления окна. Исключения антивируса на папку
+#      проекта тут не помогают — распаковка идёт в %TEMP%.
+#
+#      В режиме onedir распаковки нет вообще: зависимости читаются прямо
+#      из _internal\ рядом с .exe. Антивирус не вмешивается, старт быстрее.
+#
+#      Цена: получается папка, а не один файл. Для переноса копируйте ВСЮ
+#      папку целиком (или упакуйте её в ZIP / сделайте установщик).
 #
 #  Рассчитан на запуск двойным кликом на машине БЕЗ установленного Python:
-#  все зависимости упаковываются внутрь одного файла.
+#  все зависимости лежат в _internal\ рядом с .exe.
 # ============================================================
 
 import os
@@ -120,16 +138,20 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+    # ------------------------------------------------------------
+    #  ONEDIR: a.binaries и a.datas сюда НЕ передаются.
+    #  Они уходят в COLLECT() ниже и раскладываются в _internal\.
+    #  Именно флаг exclude_binaries=True переключает сборку в onedir:
+    #  если его убрать и вернуть a.binaries/a.datas внутрь EXE,
+    #  PyInstaller снова соберёт onefile и проблема с %TEMP% вернётся.
+    # ------------------------------------------------------------
+    exclude_binaries=True,
     name="Генератор_КП_GigaChat",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
     upx_exclude=[],
-    runtime_tmpdir=None,
     # console=False — без чёрного окна консоли.
     # Логи всё равно пишутся в файл (logs/ рядом с .exe), а также доступны
     # кнопкой «📋 Диагностика» в интерфейсе.
@@ -140,4 +162,19 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=icon_path if has_icon else None,
+)
+
+# ---------- Сборка папки (ONEDIR) ----------
+# COLLECT складывает загрузчик, библиотеки и данные в одну папку.
+# contents_directory="_internal" задан явно, чтобы не зависеть от того,
+# какую папку по умолчанию выберет очередная версия PyInstaller.
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name="Генератор_КП_GigaChat",
+    contents_directory="_internal",
 )
