@@ -46,6 +46,18 @@ try {
     Invoke-Git @('rev-parse', '--is-inside-work-tree') | Out-Null
     if ($script:GitExitCode -ne 0) { Write-Log "ОШИБКА: $RepoPath не является git-репозиторием"; exit 1 }
 
+    # ---------- Проверяем доступ на запись к GitHub ----------
+    # Если авторизация потеряна, незачем плодить локальные коммиты: они будут
+    # копиться молча. Лучше сообщить об этом в лог сразу.
+    $env:GIT_TERMINAL_PROMPT = '0'
+    Invoke-Git @('ls-remote', '--exit-code', 'origin', 'HEAD') | Out-Null
+    if ($script:GitExitCode -ne 0) {
+        Write-Log "ОШИБКА: нет доступа к origin (авторизация GitHub)."
+        Write-Log "  Что делать: выполните в папке проекта  git push  и войдите в браузере заново,"
+        Write-Log "  либо запустите: `"$PSScriptRoot\auth-github.bat`""
+        exit 1
+    }
+
     # ---------- Есть ли что коммитить ----------
     $status = Invoke-Git @('status', '--porcelain')
     if (-not $status -and -not $Force) {
