@@ -475,9 +475,16 @@ _generation_in_progress = False
 
 
 def _set_busy(busy: bool, message: str = "") -> None:
-    """Блокирует/разблокирует кнопки и переключает статус на время генерации."""
+    """
+    Переключает состояние «идёт генерация»: блокирует кнопки и меняет статус.
+
+    ВАЖНО: эту функцию нельзя вызывать, удерживая _generation_lock —
+    она сама его захватывает, а Lock не реентрантный (получится вечный deadlock).
+    """
     global _generation_in_progress
-    _generation_in_progress = busy
+
+    with _generation_lock:
+        _generation_in_progress = busy
 
     state = "disabled" if busy else "normal"
     try:
@@ -526,7 +533,9 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
         text = ""
         error = None
 
-        # Один сетевой запрос за раз: клиент GigaChat не рассчитан на параллельность
+        # Лок держим ТОЛЬКО вокруг генерации: клиент GigaChat не рассчитан на
+        # параллельные запросы, но планировать callback под локом нельзя —
+        # finish() вызовет _set_busy(), которому нужен тот же лок (deadlock).
         with _generation_lock:
             try:
                 text = generate_text_sync(region, cities, use_cache=use_cache)
@@ -544,15 +553,32 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
             _set_busy(False, "")
             on_done(text, error)
 
-        # Возвращаемся в главный поток Tk
-        try:
-            window.after(0, finish)
-        except Exception:
-            # Окно уже закрыто
-            pass
+        _dispatch_to_ui(finish)
 
     threading.Thread(target=worker, name="gigachat-generate", daemon=True).start()
     return True
+
+
+def _dispatch_to_ui(func) -> None:
+    """
+    Выполняет func в главном потоке Tk.
+
+    Вызывать виджеты из рабочего потока нельзя, поэтому используем
+    window.after(0, ...). Если окно уже закрыто или главный цикл Tk
+    недоступен — снимаем флаг занятости, чтобы кнопки не остались мёртвыми.
+    """
+
+    def fallback():
+        try:
+            _set_busy(False, "")
+        except Exception:
+            pass
+
+    try:
+        window.after(0, func)
+    except Exception as e:
+        logger.debug("Не удалось отправить callback в главный поток Tk: %s", e)
+        fallback()
 
 
 def refresh_preview_async() -> None:
