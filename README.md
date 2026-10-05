@@ -101,3 +101,4 @@ python scripts/setup.py
 ## 📄 Лицензия
 
 MIT
+<!-- autosync smoke test 12:25:55 -->
