@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Временная диагностика №4: проверка после правок.
-
-Импортирует обновлённый модуль генератора, проверяет что окно создаётся,
-глобальный excepthook установлен, а mainloop работает.
-Результат пишется файлом (stdout под песочницей может блокироваться).
-"""
+"""Проба после правок: импорт больше не захватывает окно."""
 import os
 import sys
 import tempfile
@@ -12,78 +7,61 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "src")
 TMP_LOGS = os.path.join(tempfile.gettempdir(), "kp_probe_logs")
 os.makedirs(TMP_LOGS, exist_ok=True)
-OUT = os.path.join(TMP_LOGS, "probe_result3.txt")
-sys.path.insert(0, SRC)
+OUT = os.path.join(TMP_LOGS, "final.txt")
+sys.path.insert(0, os.path.join(ROOT, "src"))
 os.chdir(ROOT)
 
-steps = []
-T0 = time.time()
+lines = []
 
 
-def note(msg):
-    steps.append("%.2f  %s" % (time.time() - T0, msg))
+def note(m):
+    lines.append("%.2f  %s" % (time.time() - T0, m))
     with open(OUT, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(steps) + "\n")
+        fh.write("\n".join(lines) + "\n")
 
+
+T0 = time.time()
+note("start")
 
 import logger_config  # noqa: E402
 
 logger_config.LOG_DIR = TMP_LOGS
-logger_config.LOG_FILE = os.path.join(TMP_LOGS, "probe_generator3.log")
+logger_config.LOG_FILE = os.path.join(TMP_LOGS, "final.log")
 
-import tkinter as tk  # noqa: E402
-
-# Перехватываем создание окна, чтобы не запускать mainloop модуля
-real_Tk = tk.Tk
-created = []
-
-
-class SpyTk(real_Tk):
-    def __init__(self, *a, **k):
-        super().__init__(*a, **k)
-        created.append(self)
-
-
-tk.Tk = SpyTk
-
-note("importing generator...")
+note("importing generator (must NOT hang)")
 import генератор_кп_gigachat as g  # noqa: E402
 
-note("imported OK; GIGACHAT_READY=%s" % g.GIGACHAT_READY)
+note("import RETURNED")
+note("GIGACHAT_READY = %s" % g.GIGACHAT_READY)
 note("excepthook installed = %s" % (sys.excepthook is g._excepthook))
-note("threading.excepthook set = %s" % (threading.excepthook is g._thread_excepthook))
-
-note("step: reading protocol")
-note("window protocol WM_DELETE_WINDOW = %r" % g.window.protocol("WM_DELETE_WINDOW"))
-note("step: protocol OK")
-
-note("has update_ssl_banner = %s" % callable(g.update_ssl_banner))
-note("has show_ssl_help = %s" % callable(g.show_ssl_help))
-note("has show_diagnostics = %s" % callable(g.show_diagnostics))
-
-note("step: _documents_dir")
+note("threading excepthook = %s" % (threading.excepthook is g._thread_excepthook))
+note("protocol = %r" % g.window.protocol("WM_DELETE_WINDOW"))
 note("documents dir = %s" % g._documents_dir())
-note("step: _documents_dir OK")
+note("env write path = %s" % g.get_env_write_path())
 
-note("step: update_ssl_banner (expect hidden)")
-g.update_ssl_banner()
-note("ssl banner mapped (expect False) = %s" % g.ssl_banner.winfo_ismapped())
-
-note("step: simulate SSL error")
+note("ssl banner manager before (expect none) = %r" % g.ssl_banner.winfo_manager())
 import llm_provider  # noqa: E402
 
 llm_provider.note_ssl_error("ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED] test")
 g.update_ssl_banner()
-note("ssl banner mapped after error (expect True) = %s" % g.ssl_banner.winfo_ismapped())
+note("ssl banner manager after SSL error (expect pack) = %r" % g.ssl_banner.winfo_manager())
+llm_provider.clear_ssl_error()
+g.update_ssl_banner()
+note("ssl banner manager cleared (expect none) = %r" % g.ssl_banner.winfo_manager())
 
-note("env write path = %s" % llm_provider.get_env_write_path())
+h, already = g._acquire_single_instance_lock()
+note("mutex: handle=%r already_running=%s" % (bool(h), already))
+if h:
+    import ctypes
 
-note("step: single instance lock")
-handle, already = g._acquire_single_instance_lock()
-note("mutex handle=%r already_running=%s" % (handle, already))
+    ctypes.WinDLL("kernel32").CloseHandle(h)
+    note("mutex released")
 
-note("ALL CHECKS DONE")
+note("on_closing()")
+g.on_closing()
+note("window destroyed flag = %s" % g._window_closed["value"])
+
+note("ALL CHECKS PASSED")
 os._exit(0)

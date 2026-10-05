@@ -1228,6 +1228,10 @@ def enter_api_key():
 
 _window_closed = {"value": False}
 
+# Заполняются при старте главного цикла (см. _run_gui)
+_mutex_handle = None
+_already_running = False
+
 
 def on_closing() -> None:
     """Корректно закрывает окно и пишет причину в лог."""
@@ -1371,15 +1375,21 @@ def update_ssl_banner() -> None:
     """
     Показывает красную плашку, если последний запрос упал по SSL.
 
-    Вызывается из главного потока после каждой генерации: менять виджеты
-    из фонового потока в Tkinter нельзя.
+    Проверяем winfo_manager(), а НЕ winfo_ismapped(): у окна, которое ещё
+    не отрисовано (или свёрнуто), ismapped() возвращает 0 даже когда плашка
+    упакована — из-за этого она не убиралась после успешного запроса.
+    Плашку мы только пакуем (pack), поэтому менеджер 'pack' == «показана».
+
+    Вызывается из главного потока: менять виджеты из фонового потока
+    в Tkinter нельзя.
     """
     try:
+        shown = bool(ssl_banner.winfo_manager())
         if has_ssl_error():
-            if not ssl_banner.winfo_ismapped():
+            if not shown:
                 ssl_banner.pack(fill="x", padx=20, pady=4)
         else:
-            if ssl_banner.winfo_ismapped():
+            if shown:
                 ssl_banner.pack_forget()
     except Exception as exc:
         logger.debug("Не удалось обновить SSL-плашку: %s", exc)
@@ -1681,54 +1691,73 @@ tk.Button(
 
 logger.info("Интерфейс загружен")
 
-# Обработчик крестика подключаем сразу после создания окна
-window.protocol("WM_DELETE_WINDOW", on_closing)
 
-# Первый предпросмотр и прогрев авторизации — в фоне, окно открывается сразу
-window.after(100, refresh_preview_async)
+def _run_gui() -> int:
+    """
+    Запускает главный цикл приложения.
 
-if GIGACHAT_READY:
-    threading.Thread(target=warmup_gigachat, name="gigachat-startup-warmup", daemon=True).start()
-else:
-    logger.warning(
-        "Ключ GigaChat не задан — используется шаблонный текст. "
-        "Введите ключ кнопкой «🔑 Ключ» или в файле .env"
-    )
+    ВАЖНО: главный цикл вынесен в функцию и вызывается только при прямом
+    запуске файла (и только под __name__ == "__main__"). Раньше mainloop()
+    вызывался на уровне модуля, поэтому ЛЮБОЙ импорт этого файла
+    (диагностика, тест, внешний запускатель) захватывал окно и висел —
+    отладить проблему запуска было нельзя.
 
-# ============================================
-# ГЛАВНЫЙ ЦИКЛ
-# ============================================
+    Returns:
+        Код возврата процесса.
+    """
+    # Обработчик крестика: закрытие всегда идёт через destroy() и попадает в лог
+    window.protocol("WM_DELETE_WINDOW", on_closing)
 
-_mutex_handle, _already_running = _acquire_single_instance_lock()
-if _already_running:
-    # Не мешаем работать, но честно говорим в логе, что это вторая копия
-    logger.warning(
-        "Обнаружена уже запущенная копия программы — работаю вторым экземпляром"
-    )
+    # Первый предпросмотр и прогрев авторизации — в фоне, окно открывается сразу
+    window.after(100, refresh_preview_async)
 
-try:
-    window.mainloop()
-except SystemExit as exc:
-    logger.info("Выход по SystemExit: %s", exc)
-except BaseException as exc:
-    # Падение в главном цикле больше не выглядит как «окно мигнуло и исчезло»
-    logger.critical("КРИТИЧЕСКАЯ ОШИБКА в главном цикле", exc_info=True)
-    try:
-        messagebox.showerror(
-            "Критическая ошибка",
-            "❌ Программа столкнулась с ошибкой и будет закрыта.\n\n"
-            f"{type(exc).__name__}: {exc}\n\n"
-            f"Подробности записаны в лог:\n{LOG_FILE_HINT}",
-        )
-    except Exception:
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
-else:
-    # mainloop вернулся нормально — это штатное закрытие окна
-    if not _window_closed["value"]:
+    if GIGACHAT_READY:
+        threading.Thread(
+            target=warmup_gigachat, name="gigachat-startup-warmup", daemon=True
+        ).start()
+    else:
         logger.warning(
-            "Главный цикл завершился БЕЗ команды закрытия окна — "
-            "проверьте, не закрыла ли программу другая программа "
-            "(антивирус, диспетчер задач)"
+            "Ключ GigaChat не задан — используется шаблонный текст. "
+            "Введите ключ кнопкой «🔑 Ключ» или в файле .env"
         )
 
-logger.info("Программа завершена")
+    global _mutex_handle, _already_running
+    _mutex_handle, _already_running = _acquire_single_instance_lock()
+    if _already_running:
+        # Не мешаем работать, но честно говорим в логе, что это вторая копия
+        logger.warning(
+            "Обнаружена уже запущенная копия программы — работаю вторым экземпляром"
+        )
+
+    try:
+        window.mainloop()
+    except SystemExit as exc:
+        logger.info("Выход по SystemExit: %s", exc)
+    except BaseException as exc:
+        # Падение в главном цикле больше не выглядит как «окно мигнуло и исчезло»
+        logger.critical("КРИТИЧЕСКАЯ ОШИБКА в главном цикле", exc_info=True)
+        try:
+            messagebox.showerror(
+                "Критическая ошибка",
+                "❌ Программа столкнулась с ошибкой и будет закрыта.\n\n"
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"Подробности записаны в лог:\n{LOG_FILE_HINT}",
+            )
+        except Exception:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+        return 1
+    else:
+        # mainloop вернулся нормально — это штатное закрытие окна
+        if not _window_closed["value"]:
+            logger.warning(
+                "Главный цикл завершился БЕЗ команды закрытия окна — "
+                "проверьте, не закрыла ли программу другая программа "
+                "(антивирус, диспетчер задач)"
+            )
+
+    logger.info("Программа завершена")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_gui())
