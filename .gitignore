@@ -48,6 +48,10 @@ Desktop.ini
 *.bak
 *.tmp
 
+# Собранный программой набор корневых сертификатов (создаётся при запуске)
+ca_bundle_merged.pem
+config/ca_bundle_merged.pem
+
 # === Секреты (GigaChat API и т.п.) ===
 .env
 .env.local

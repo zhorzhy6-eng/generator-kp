@@ -308,6 +308,36 @@ def install_git_hook() -> bool:
 # ============================================
 
 
+def check_syntax(path: Path) -> bool:
+    """
+    Проверяет, что файл компилируется, и печатает результат.
+
+    Сначала пробуем py_compile — он ещё и создаёт кэш .pyc, ускоряя запуск.
+    Но у py_compile есть побочный эффект: он ОБЯЗАН записать кэш, и на папке
+    без права записи (Program Files, каталог только для чтения) проверка
+    падала бы с PermissionError, хотя исходник в порядке. В этом случае
+    переходим на compile() — он проверяет тот же синтаксис, ничего не записывая.
+    """
+    try:
+        import py_compile
+
+        py_compile.compile(str(path), doraise=True)
+        print(f"    ✅ {path.name}")
+        return True
+    except PermissionError:
+        # Папка кэша недоступна — проверяем синтаксис без записи на диск
+        try:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        except Exception as exc:
+            print(f"    ❌ {path.name}: {exc}")
+            return False
+        print(f"    ✅ {path.name} (без кэша .pyc: папка недоступна для записи)")
+        return True
+    except Exception as exc:
+        print(f"    ❌ {path.name}: {exc}")
+        return False
+
+
 def check_sources() -> bool:
     step(4, "Проверка исходников")
 
@@ -324,19 +354,25 @@ def check_sources() -> bool:
             print(f"  ❌ Нет файла: {path}")
             ok = False
             continue
-        code = run([sys.executable, "-m", "py_compile", path])
-        print(f"    {'✅' if code == 0 else '❌'} {path.name}")
-        if code != 0:
+        if not check_syntax(path):
             ok = False
 
-    # Напоминаем про сертификат: без него EXE соберётся, но SSL не вылечится
-    ca = CONFIG_DIR / "russian_trusted_root_ca.cer"
-    if ca.is_file():
+    # Напоминаем про сертификат: без него EXE соберётся, но SSL не вылечится.
+    # Программа ищет сертификат и в config\, и просто рядом с собой, поэтому
+    # оба места равнозначны — раньше проверялось только config\, и установщик
+    # ругался, хотя сертификат лежал в корне проекта.
+    ca_candidates = [
+        CONFIG_DIR / "russian_trusted_root_ca.cer",
+        PROJECT_ROOT / "russian_trusted_root_ca.cer",
+    ]
+    ca = next((path for path in ca_candidates if path.is_file()), None)
+    if ca is not None:
         print(f"\n  ✅ Сертификат Минцифры найден: {ca}")
-        print("     Он будет упакован в EXE.")
+        print("     При сборке он попадёт в папку сборки (config\\).")
     else:
-        print("\n  ⚠️  Сертификат Минцифры не найден:")
-        print(f"     {ca}")
+        print("\n  ⚠️  Сертификат Минцифры не найден. Искали:")
+        for path in ca_candidates:
+            print(f"     {path}")
         print("     Если GigaChat падает с SSL-ошибкой, скачайте его:")
         print("     https://gu-st.ru/content/Other/doc/russian_trusted_root_ca.cer")
 
@@ -464,15 +500,32 @@ def ensure_data_files(final_dir: Path) -> None:
     copied = sorted(p.name for p in config_target.iterdir() if p.is_file())
     print(f"        ✅ config\\ — файлов: {len(copied)}" + (f" ({', '.join(copied)})" if copied else ""))
 
-    # Сертификат Минцифры — единственный файл, без которого GigaChat не
-    # заработает в сети с подменой TLS, поэтому о нём говорим отдельно.
-    ca_names = ("russian_trusted_root_ca.cer", "ca_bundle_merged.pem")
-    if any((config_target / name).is_file() for name in ca_names):
+    # Сертификат Минцифры мог лежать не в config\, а просто в корне проекта —
+    # программа ищет его в обоих местах, поэтому для неё это нормально.
+    # В папку сборки его всё равно кладём в config\: так у пользователя
+    # есть одно очевидное место, где лежат сертификаты.
+    ca_name = "russian_trusted_root_ca.cer"
+    if not (config_target / ca_name).is_file():
+        for source in (
+            PROJECT_ROOT / ca_name,
+            final_dir / ca_name,  # сертификат, положенный рядом с прошлой сборкой
+        ):
+            if source.is_file():
+                try:
+                    shutil.copy2(source, config_target / ca_name)
+                    print(f"        ✅ {ca_name} — взят из {source.parent}")
+                except Exception as exc:
+                    print(f"        ⚠️  {ca_name} не скопирован: {exc}")
+                break
+
+    ca_names = (ca_name, "ca_bundle_merged.pem")
+    if any((config_target / name).is_file() or (final_dir / name).is_file() for name in ca_names):
         print("        ✅ сертификат для проверки TLS на месте")
     else:
         print("        ⚠️  сертификата Минцифры нет ни в config\\, ни рядом с программой.")
-        print("           Положите config\\russian_trusted_root_ca.cer и соберите заново,")
-        print("           либо нажмите «📋 Диагностика» в программе — она подскажет путь.")
+        print("           Положите russian_trusted_root_ca.cer в корень проекта")
+        print("           (или в config\\) и соберите заново — либо нажмите")
+        print("           «📋 Диагностика» в программе: она покажет, где искали.")
 
 
 def build(spec: Path, label: str, bundle_name: str, exe_name: str) -> bool:

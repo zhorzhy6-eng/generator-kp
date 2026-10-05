@@ -820,6 +820,8 @@ def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
     """
     log = logger_ or logger
 
+    import tempfile
+
     config_dir = PROJECT_ROOT / "config"
     if IS_FROZEN:
         try:
@@ -857,11 +859,45 @@ def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
 
     av_roots = _interceptor_pem_files(exclude=target)
     for av_path, av_subject in av_roots:
-        log.info("SSL: корень SSL-инспекции (антивирус/прокси) добавлен в склейку: %s", av_subject)
         add(av_path)
 
     if not candidates:
         return None
+
+    # Отпечаток источников: пути, размеры и время изменения. По нему видно,
+    # изменился ли хоть один сертификат с прошлого запуска. Это позволяет
+    # НЕ пересобирать склейку на каждом старте программы: сборка заново
+    # читает ~120 сертификатов и заметно тормозит запуск.
+    fingerprint_parts: List[str] = []
+    for path in candidates:
+        try:
+            stat = path.stat()
+            fingerprint_parts.append(f"{path}|{stat.st_size}|{int(stat.st_mtime)}")
+        except OSError:
+            continue
+    sources_fingerprint = hashlib.sha1(
+        "\n".join(fingerprint_parts).encode("utf-8", errors="replace")
+    ).hexdigest()
+
+    def is_current(candidate_file: Path) -> bool:
+        """True, если готовая склейка собрана из тех же источников."""
+        try:
+            if not candidate_file.is_file():
+                return False
+            with candidate_file.open("r", encoding="utf-8", errors="ignore") as handle:
+                for _ in range(6):
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if line.startswith("# sources="):
+                        return line.strip().endswith(sources_fingerprint)
+        except Exception:
+            return False
+        return False
+
+    for known_path in (target, Path(tempfile.gettempdir()) / MERGED_CA_BUNDLE_FILENAME):
+        if is_current(known_path):
+            return known_path
 
     # Собираем блоки сертификатов по одному, сохраняя порядок источников:
     # Минцифры → свои сертификаты из config\ → корень антивируса → certifi.
@@ -904,6 +940,7 @@ def build_ca_bundle(logger_: Optional[Any] = None) -> Optional[Path]:
         "# Файл создаётся программой при запуске, править его вручную не нужно.\n"
         f"# Корней в наборе: {len(merged_blocks)}. Источники: config\\, certifi, "
         "хранилище Windows.\n"
+        f"# sources={sources_fingerprint}\n"
     )
     content = header + "\n".join(merged_blocks) + "\n"
 
