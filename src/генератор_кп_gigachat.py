@@ -564,6 +564,31 @@ _PAY_LINE_MARKERS = (
 )
 
 
+def _mentions_route_city(line: str, cities: Optional[List[str]]) -> bool:
+    """
+    Есть ли в строке хотя бы один город из маршрута.
+
+    Сравниваем по первому слову названия: «Владивосток → Москва» и
+    «Владивосток» должны считаться одним городом.
+    """
+    if not cities:
+        return False
+
+    low = line.lower()
+    for city in cities:
+        for part in city.split("→"):
+            word = part.strip().lower()
+            if not word:
+                continue
+            # «Ростов-на-Дону» ищем целиком, «Владивосток → Москва» — по частям
+            if word in low:
+                return True
+            head = word.split()[0] if word.split() else ""
+            if len(head) > 4 and head in low:
+                return True
+    return False
+
+
 def _iter_body_lines(text: str) -> List[str]:
     """
     Разбивает ответ модели на строки, попутно снимая markdown и декор.
@@ -602,7 +627,9 @@ def _strip_decorative_emoji(line: str, keep: str) -> str:
     ).strip()
 
 
-def build_body_from_ai(text: str, pay_key: str) -> Tuple[str, str, str]:
+def build_body_from_ai(
+    text: str, pay_key: str, cities: Optional[List[str]] = None
+) -> Tuple[str, str, str]:
     """
     Превращает ответ модели в три строки тела: 🚗 статус, 💰 оплата, ✍️ призыв.
 
@@ -635,6 +662,10 @@ def build_body_from_ai(text: str, pay_key: str) -> Tuple[str, str, str]:
     if status_line:
         status_line = _strip_decorative_emoji(status_line, "🚗")
     if len(status_line) < 15 or "автовоз" not in status_line.lower():
+        status_line = random.choice(STATUSES)
+    elif _mentions_route_city(status_line, cities):
+        # «…автовоз! Москва—Владивосток, Россия.» — города уже есть в блоке
+        # маршрута, в статусе они только создают путаницу.
         status_line = random.choice(STATUSES)
 
     if cta_line:
@@ -771,7 +802,9 @@ def generate_text_sync(
             # Заголовок, маршрут и оплату подставляет код, а не модель: у ИИ
             # берём только фразу-статус. Иначе в тексте появлялись чужие города
             # или пропадала строка оплаты вместе с упоминанием НДС.
-            status_line, pay_line_text, cta_line = build_body_from_ai(ai_text, pay_key)
+            status_line, pay_line_text, cta_line = build_body_from_ai(
+                ai_text, pay_key, route_cities
+            )
             route_block = build_route_block(route_cities)
             if route_block:
                 result = (
