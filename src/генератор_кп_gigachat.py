@@ -112,10 +112,46 @@ AI_MAX_TOKENS = 150        # короче ответ — быстрее прих
 # только для справки в логе/интерфейсе, чтобы не было двух правд.
 AI_TIMEOUT = int(DEFAULT_GIGACHAT_TIMEOUT)
 
-# Короткий системный промпт: меньше токенов на вход — быстрее ответ
+# Короткий системный промпт: меньше токенов на вход — быстрее ответ.
+# Специфика проекта: машины в лоте — это ГРУЗ для автовоза, а не наш транспорт,
+# поэтому роль и запреты продублированы здесь явно (провайдер общий с другими
+# задачами и его DEFAULT_SYSTEM_PROMPT может измениться).
 GIGACHAT_SYSTEM_PROMPT = (
-    DEFAULT_SYSTEM_PROMPT + " Отвечай строго 3 предложениями и коротким призывом к действию."
+    DEFAULT_SYSTEM_PROMPT
+    + " Ты пишешь объявление для автовозов: «лот машин» — это груз, который ждёт"
+    " автовоз. Отвечай 4–5 строками: заголовок, маршрут, одна фраза про ожидание"
+    " автовоза, оплата и короткий призыв писать в личку."
 )
+
+# ============================================
+# ТИП ОПЛАТЫ (влияет и на промпт ИИ, и на шаблонный текст)
+# ============================================
+
+# Ключ -> (надпись в интерфейсе, формулировка для текста КП)
+PAYMENT_TYPES: Dict[str, Tuple[str, str]] = {
+    "beznal_nds": ("Безнал с НДС", "Оплата по безналу (с НДС)."),
+    "beznal": ("Безнал без НДС", "Оплата по безналу (без НДС)."),
+    "cash": ("Наличные", "Оплата наличными (без НДС)."),
+    "discuss": ("Обсуждается", "Оплата обсуждается."),
+}
+PAYMENT_ORDER = list(PAYMENT_TYPES.keys())
+DEFAULT_PAYMENT_KEY = "beznal_nds"
+
+# Надпись для выпадающего списка (по ней же ищем ключ при выборе)
+PAYMENT_LABELS = [label for label, _ in PAYMENT_TYPES.values()]
+
+
+def payment_key_from_label(label: str) -> str:
+    """Превращает надпись из списка в ключ. Неизвестная надпись → оплата по умолчанию."""
+    for key, (shown, _) in PAYMENT_TYPES.items():
+        if shown == label:
+            return key
+    return DEFAULT_PAYMENT_KEY
+
+
+def payment_line(key: str) -> str:
+    """Готовая строка про оплату для текста КП."""
+    return PAYMENT_TYPES.get(key, PAYMENT_TYPES[DEFAULT_PAYMENT_KEY])[1]
 
 # Значения, которые считаем «ключ не задан» (для отчёта диагностики).
 # Держим копию списка из llm_provider: GUI не должен зависеть от приватных
@@ -164,7 +200,13 @@ def load_settings():
         return None
 
 
-def save_settings(selected_cities, region, use_ai=True, creativity=0.8):
+def save_settings(
+    selected_cities,
+    region,
+    use_ai=True,
+    creativity=0.8,
+    payment_key: str = DEFAULT_PAYMENT_KEY,
+):
     """Сохраняет настройки в файл. Ключи GigaChat здесь НЕ хранятся."""
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -175,13 +217,17 @@ def save_settings(selected_cities, region, use_ai=True, creativity=0.8):
                     "use_ai": use_ai,
                     "model": GIGACHAT_MODEL,
                     "creativity": creativity,
+                    "payment": payment_key,
                 },
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
         logger.info(
-            "Настройки сохранены: регион=%s, городов=%d", region, len(selected_cities)
+            "Настройки сохранены: регион=%s, городов=%d, оплата=%s",
+            region,
+            len(selected_cities),
+            payment_key,
         )
     except Exception as e:
         logger.error("Ошибка сохранения настроек: %s", e)
@@ -194,13 +240,20 @@ if saved:
     CURRENT_REGION = saved.get("region", "Юга")
     USE_AI = saved.get("use_ai", True)
     CREATIVITY = saved.get("creativity", 0.8)
+    PAYMENT_KEY = saved.get("payment", DEFAULT_PAYMENT_KEY)
+    if PAYMENT_KEY not in PAYMENT_TYPES:
+        # Старый или битый settings.json — не роняем программу, берём умолчание
+        PAYMENT_KEY = DEFAULT_PAYMENT_KEY
 else:
     SELECTED_CITIES = []
     CURRENT_REGION = "Юга"
     USE_AI = True
     CREATIVITY = 0.8
+    PAYMENT_KEY = DEFAULT_PAYMENT_KEY
 
-logger.info("Загружена креативность: %s", CREATIVITY)
+logger.info(
+    "Загружена креативность: %s, тип оплаты: %s", CREATIVITY, PAYMENT_KEY
+)
 
 # ============================================
 # СПИСКИ ГОРОДОВ
@@ -248,57 +301,51 @@ CREATIVE_MODE = "✨ Без города (креативный режим)"
 # ============================================
 # ВАРИАНТЫ СТИЛЕЙ ДЛЯ FALLBACK-ШАБЛОНОВ
 # ============================================
+#
+# Специфика проекта: машины в лоте — это ГРУЗ для автовоза. Поэтому в каждой
+# фразе рядом с упоминанием машин стоит контекст «на автовоз»: иначе читатель
+# понимает текст как «наши машины/транспорт готовы ехать».
 
 OPENERS = [
-    "🔥 Лоты сформированы!",
-    "🚛 Свежие машины в наличии!",
-    "💥 Отличные предложения!",
-    "⭐ Авто готовы к отправке!",
-    "📦 Машины на месте!",
-    "🚀 Горячие лоты!",
-    "⚡ Быстрая загрузка!",
-    "🎯 Точечные предложения!",
-    "🏆 Топ-лоты!",
-    "✨ Свежее поступление!",
+    "🚛 Есть лот машин на автовоз!",
+    "🚛 Свежий лот на автовоз — забирайте!",
+    "🚛 Лот машин ждёт автовоз!",
+    "🚛 Автовозам: свежий лот машин!",
+    "🚛 Лот сформирован, ищем автовоз!",
+    "🚛 Груз для автовоза — маршрут ниже!",
+    "🚛 Машины на отправку — нужен автовоз!",
+    "🚛 Новый лот машин под автовоз!",
+    "🚛 Есть машины на перевозку автовозом!",
+    "🚛 Лот машин — загрузка на автовоз!",
 ]
 
 STATUSES = [
-    "машины в наличии, загрузка быстрая.",
-    "авто готовы к отправке в любой момент.",
-    "лоты полностью укомплектованы.",
-    "машины на площадке, ждут загрузки.",
-    "транспорт готов к выезду.",
-    "все авто в наличии, документы в порядке.",
-    "машины уже на месте, готовы к погрузке.",
-    "лоты сформированы, отправка сегодня.",
-]
-
-PAYMENTS = [
-    "Работаем по безналу, сроки обсуждаем.",
-    "Оплата безналичная, возможна предоплата.",
-    "Гибкие условия оплаты, безналичный расчёт.",
-    "Предоплата или полная оплата — на ваш выбор.",
-    "Безналичный расчёт, работаем с юрлицами.",
-    "Оплата по безналу, договор сразу.",
+    "🚗 Машины готовы к погрузке на автовоз.",
+    "🚗 Лот сформирован, машины ждут автовоз.",
+    "🚗 Автомобили для перевозки — ищем автовоз.",
+    "🚗 Есть машины на перевозку автовозом.",
+    "🚗 Машины ждут загрузки на автовоз.",
+    "🚗 Машины на площадке — нужен автовоз под погрузку.",
+    "🚗 Лот машин ждёт автовоз, загрузка быстрая.",
+    "🚗 Машины ждут своей очереди на автовоз.",
 ]
 
 LEGALS = [
-    "Заключаем договор, гарантируем надёжность.",
-    "Работаем по договору, все выплаты в срок.",
-    "Официальное оформление, без задержек.",
-    "Договор сразу, платим чётко по графику.",
-    "Юридически чистая сделка, договор гарантирует.",
-    "Официально, по договору, без задержек.",
+    "📋 Работаем по договору, оплата без задержек.",
+    "📄 Заключаем договор, выплаты строго в срок.",
+    "🤝 Официальное оформление, гарантируем надёжность.",
+    "📑 Работаем официально, с НДС, без просрочек.",
+    "📋 Все сделки по договору, выплаты чётко в срок.",
+    "📄 Юридически чистая сделка — договор и закрывающие документы.",
 ]
 
 CTA = [
-    "Ждём ваших ставок!",
-    "Пишите в ЛС!",
-    "Обсудим детали!",
-    "Звоните, договариваемся!",
-    "Все вопросы в личку!",
-    "Ждём ваших сообщений!",
-    "Пишите уже сегодня!",
+    "✍️ Все детали и ставки — в личку. Пишите!",
+    "✍️ Ставки и подробности — в личные сообщения.",
+    "✍️ Детали и ставки — в личку, ждём сообщений!",
+    "✍️ Пишите в личку — обсудим ставки и даты.",
+    "✍️ Подробности и ставки — только в личку.",
+    "✍️ Всё по лоту — в личку. Пишите!",
 ]
 
 # ============================================
@@ -315,9 +362,14 @@ class AIGuard:
         if not text or len(text.strip()) < 20:
             return False, "Текст слишком короткий"
 
-        required_keywords = ["машин", "ло", "груз", "авто", "транспорт"]
+        # «автовоз» обязателен: без него текст читается как предложение нашего
+        # транспорта, а не лота машин, который ждёт перевозчика-автовоза.
+        required_keywords = ["автовоз", "машин", "ло", "груз", "авто", "транспорт"]
         if not any(kw in text.lower() for kw in required_keywords):
             return False, "Нет ключевых слов по теме"
+
+        if "автовоз" not in text.lower():
+            return False, "В тексте нет контекста автовоза"
 
         wrong_phrases = ["ваши грузы", "ваш груз", "вашего груза", "погрузим ваши"]
         if any(phrase in text.lower() for phrase in wrong_phrases):
@@ -381,12 +433,16 @@ class AICache:
 # ============================================
 
 
-def _build_prompt(region: str, cities: List[str]) -> str:
+def _build_prompt(region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT_KEY) -> str:
     """
     Короткий промпт: меньше входных токенов — быстрее ответ.
 
     Держим его компактным осознанно: длинные инструкции заметно увеличивают
     время генерации, а качество для такого короткого текста не растёт.
+
+    Специфика автовозов передана явно: машины в лоте — это груз, который ждёт
+    автовоз. Без этого модель писала «авто готовы к отправке», и текст читался
+    как предложение наших грузовиков, а не лота для перевозчика.
     """
     region_map = {
         "Юга": "юг России (Ростов, Краснодар, Новороссийск)",
@@ -397,15 +453,21 @@ def _build_prompt(region: str, cities: List[str]) -> str:
     cities_str = ", ".join(cities) if cities else "все города"
 
     return (
-        f"Напиши коммерческое предложение по автоперевозкам. "
-        f"Маршрут: Москва → {region_desc}. "
+        f"Составь коммерческое предложение для перевозчиков-автовозов. "
+        f"Лот машин (груз) нужно перевезти автовозом: Москва → {region_desc}. "
         f"Города: {cities_str}. "
-        f"Упомяни: машины в наличии, оплата безналом, работа по договору. "
-        f"3 предложения. В конце призыв к действию."
+        f"Оплата: {payment_line(pay_key)} "
+        f"Требования: начни с эмодзи 🚛 и слов «Лот машин на автовоз»; "
+        f"покажи маршрут «Погрузка: X → Выгрузка: Y»; одна фраза про то, что машины "
+        f"ждут автовоз (🚗); тип оплаты (💰); призыв писать в личку (✍️). "
+        f"4-5 строк, без markdown и без пояснений. "
+        f"ЗАПРЕЩЕНО писать цену, количество машин и названия машин."
     )
 
 
-def generate_with_gigachat(region: str, cities: List[str]) -> Optional[str]:
+def generate_with_gigachat(
+    region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT_KEY
+) -> Optional[str]:
     """
     Генерация текста через GigaChat.
 
@@ -415,7 +477,7 @@ def generate_with_gigachat(region: str, cities: List[str]) -> Optional[str]:
     if not GIGACHAT_READY:
         return None
 
-    prompt = _build_prompt(region, cities)
+    prompt = _build_prompt(region, cities, pay_key)
 
     start = time.time()
     text = generate_gigachat(
@@ -458,6 +520,32 @@ def get_current_region():
         return "Восток"
 
 
+def get_payment_key() -> str:
+    """
+    Возвращает выбранный тип оплаты.
+
+    Значение читается из выпадающего списка, а PAYMENT_KEY — запасной вариант:
+    до создания виджета (или если Tk уже не отвечает) функция не должна падать.
+    """
+    try:
+        label = payment_var.get()
+    except NameError:
+        return PAYMENT_KEY
+    return payment_key_from_label(label)
+
+
+def update_payment(_event=None):
+    """Обработчик выбора оплаты: сохраняем настройку и обновляем предпросмотр."""
+    global PAYMENT_KEY
+    PAYMENT_KEY = get_payment_key()
+    logger.info("Выбран тип оплаты: %s", PAYMENT_KEY)
+    AICache.clear()  # старый текст собран с прежней формулировкой оплаты
+    save_settings(
+        get_selected_cities(), get_current_region(), USE_AI, CREATIVITY, PAYMENT_KEY
+    )
+    refresh_preview_async()
+
+
 def format_cities_list(cities: List[str]) -> str:
     """Форматирует список городов для вставки в текст"""
     if not cities:
@@ -479,29 +567,34 @@ def format_cities_list(cities: List[str]) -> str:
     return random.choice(styles)()
 
 
-def build_template_text(cities_text: str) -> str:
-    """Fallback: собирает текст из случайных шаблонных фраз."""
+def build_template_text(cities_text: str, pay_key: str = DEFAULT_PAYMENT_KEY) -> str:
+    """
+    Fallback: собирает текст из случайных шаблонных фраз.
+
+    Структура повторяет то, что мы требуем от ИИ: заголовок с автовозом,
+    маршрут, фраза про ожидание автовоза, оплата и призыв в личку.
+    """
     opener = random.choice(OPENERS)
     status = random.choice(STATUSES)
-    payment = random.choice(PAYMENTS)
     legal = random.choice(LEGALS)
     cta = random.choice(CTA)
-
-    variants = [
-        f"{opener} {status} {payment} {legal} {cta}",
-        f"{opener} {payment} {status} {legal} {cta}",
-        f"{opener} {status} {legal} {payment} {cta}",
-    ]
-
-    result = random.choice(variants)
+    pay = payment_line(pay_key)
 
     if cities_text:
-        result = f"{result}\n\n{cities_text}"
+        route_block = f"📍 Погрузка: Москва\n📍 Выгрузка: {cities_text}"
+    else:
+        route_block = "📍 Маршрут: Москва → по направлению"
 
-    return result
+    blocks = [opener, route_block, status, f"💰 {pay} {legal}", cta]
+    return "\n\n".join(blocks)
 
 
-def generate_text_sync(region: str, cities: List[str], use_cache: bool = True) -> str:
+def generate_text_sync(
+    region: str,
+    cities: List[str],
+    use_cache: bool = True,
+    pay_key: str = DEFAULT_PAYMENT_KEY,
+) -> str:
     """
     Синхронно генерирует текст: сначала GigaChat, при неудаче — шаблоны.
 
@@ -513,9 +606,11 @@ def generate_text_sync(region: str, cities: List[str], use_cache: bool = True) -
 
     if USE_AI and GIGACHAT_READY:
         city_str = ",".join(sorted(route_cities))
-        # Уникальный ключ: кэш не должен «залипать» на одном варианте
+        # Уникальный ключ: кэш не должен «залипать» на одном варианте.
+        # Тип оплаты входит в ключ, иначе после смены оплаты вернулся бы
+        # старый текст с прежней формулировкой.
         cache_key = (
-            f"gigachat_{region}_{city_str}_{int(CREATIVITY * 10)}_"
+            f"gigachat_{region}_{city_str}_{pay_key}_{int(CREATIVITY * 10)}_"
             f"{random.randint(1, 1000)}"
         )
 
@@ -526,7 +621,7 @@ def generate_text_sync(region: str, cities: List[str], use_cache: bool = True) -
                 return cached
 
         logger.info("Генерация GigaChat: регион=%s, городов=%d", region, len(route_cities))
-        ai_text = generate_with_gigachat(region, route_cities)
+        ai_text = generate_with_gigachat(region, route_cities, pay_key)
 
         if ai_text:
             if use_cache:
@@ -544,7 +639,7 @@ def generate_text_sync(region: str, cities: List[str], use_cache: bool = True) -
         logger.warning("ИИ включён, но GigaChat не настроен — использую шаблоны")
 
     logger.info("🔄 Использован шаблонный текст (fallback)")
-    return build_template_text(cities_text)
+    return build_template_text(cities_text, pay_key)
 
 
 # ============================================
@@ -607,6 +702,8 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
 
     region = get_current_region()
     cities = get_selected_cities()
+    # Тип оплаты снимаем в главном потоке: читать виджеты из рабочего потока нельзя
+    pay_key = get_payment_key()
 
     _set_busy(True, "⏳ Генерация... (GigaChat)")
 
@@ -619,13 +716,14 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
         # finish() вызовет _set_busy(), которому нужен тот же лок (deadlock).
         with _generation_lock:
             try:
-                text = generate_text_sync(region, cities, use_cache=use_cache)
+                text = generate_text_sync(region, cities, use_cache=use_cache, pay_key=pay_key)
             except Exception as e:
                 logger.exception("Непредвиденная ошибка генерации: %s", e)
                 error = str(e)
                 try:
                     text = build_template_text(
-                        format_cities_list([c for c in cities if c != CREATIVE_MODE])
+                        format_cities_list([c for c in cities if c != CREATIVE_MODE]),
+                        pay_key,
                     )
                 except Exception:
                     text = ""
@@ -826,7 +924,7 @@ def update_cities():
     if selected:
         global SELECTED_CITIES
         SELECTED_CITIES = selected
-        save_settings(selected, region, USE_AI, CREATIVITY)
+        save_settings(selected, region, USE_AI, CREATIVITY, PAYMENT_KEY)
 
         if len(selected) == 1:
             if selected[0] == CREATIVE_MODE:
@@ -861,7 +959,7 @@ def switch_region(event):
     if selected:
         global SELECTED_CITIES
         SELECTED_CITIES = selected
-        save_settings(selected, region, USE_AI, CREATIVITY)
+        save_settings(selected, region, USE_AI, CREATIVITY, PAYMENT_KEY)
 
     refresh_preview_async()
 
@@ -873,7 +971,9 @@ def toggle_ai():
         text=f"{'✅' if USE_AI else '❌'} ИИ: {'ВКЛ' if USE_AI else 'ВЫКЛ'}",
         bg="#4CAF50" if USE_AI else "#f44336",
     )
-    save_settings(get_selected_cities(), get_current_region(), USE_AI, CREATIVITY)
+    save_settings(
+        get_selected_cities(), get_current_region(), USE_AI, CREATIVITY, PAYMENT_KEY
+    )
     refresh_preview_async()
 
 
@@ -887,7 +987,9 @@ def update_creativity(val):
     global CREATIVITY
     CREATIVITY = float(val)
     creativity_label.config(text=f"Креативность: {int(CREATIVITY * 100)}%")
-    save_settings(get_selected_cities(), get_current_region(), USE_AI, CREATIVITY)
+    save_settings(
+        get_selected_cities(), get_current_region(), USE_AI, CREATIVITY, PAYMENT_KEY
+    )
     AICache.clear()
 
 
@@ -2134,6 +2236,32 @@ for i, city in enumerate(ALL_CITIES_EAST):
     ).grid(row=row_east, column=i % 4, padx=10, pady=2, sticky="w")
     if i % 4 == 3:
         row_east += 1
+
+# ===== ТИП ОПЛАТЫ =====
+# Отдельный выбор, потому что из макета лота оплата нигде не спрашивалась:
+# программа всегда писала «безнал». Формулировка попадает и в промпт ИИ,
+# и в шаблонный текст, и в сохранённые настройки.
+payment_frame = tk.Frame(window, bg=BG_COLOR)
+payment_frame.pack(pady=3)
+
+tk.Label(
+    payment_frame,
+    text="💰 Оплата:",
+    font=("Arial", 10, "bold"),
+    bg=BG_COLOR,
+).pack(side="left", padx=5)
+
+payment_var = tk.StringVar(value=PAYMENT_TYPES[PAYMENT_KEY][0])
+payment_combo = ttk.Combobox(
+    payment_frame,
+    textvariable=payment_var,
+    values=PAYMENT_LABELS,
+    state="readonly",
+    width=18,
+    font=("Arial", 9),
+)
+payment_combo.pack(side="left", padx=5)
+payment_combo.bind("<<ComboboxSelected>>", update_payment)
 
 tk.Button(
     window,
