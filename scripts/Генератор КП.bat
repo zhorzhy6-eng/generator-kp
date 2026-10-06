@@ -22,7 +22,7 @@ echo ╔════════════════════════
 echo ║     ГЕНЕРАТОР КОММЕРЧЕСКИХ ПРЕДЛОЖЕНИЙ    ║
 echo ╚═══════════════════════════════════════════╝
 echo.
-echo   [1] Запустить генератор (Ollama - локальный ИИ)
+echo   [1] Запустить генератор (шаблоны, без ИИ)
 echo   [2] Запустить генератор (GigaChat - облачный ИИ)
 echo   [3] Установить библиотеки
 echo   [4] Ввести API-ключ GigaChat
@@ -44,13 +44,13 @@ if "%choice%"=="7" goto EXIT
 goto MENU
 
 :: ============================================
-:: ЗАПУСК ГЕНЕРАТОРА (OLLAMA)
+:: ЗАПУСК ГЕНЕРАТОРА (ШАБЛОНЫ, БЕЗ ИИ)
 :: ============================================
 :RUN_OLLAMA
 cls
 echo.
 echo ╔═══════════════════════════════════════════╗
-echo ║       ЗАПУСК ГЕНЕРАТОРА (OLLAMA)         ║
+echo ║    ЗАПУСК ГЕНЕРАТОРА (ШАБЛОНЫ, БЕЗ ИИ)    ║
 echo ╚═══════════════════════════════════════════╝
 echo.
 
@@ -86,7 +86,7 @@ echo.
 echo ════════════════════════════════════════════
 echo.
 
-python "%PROJECT_ROOT%\src\генератор_кп_ollama.py"
+python "%PROJECT_ROOT%\src\генератор_кп.py"
 
 if errorlevel 1 (
     echo.
@@ -258,8 +258,6 @@ python -c "import requests; print('✅ requests установлен')" 2>nul ||
 python -c "import gigachat; print('✅ gigachat установлен')" 2>nul || echo ❌ gigachat НЕ УСТАНОВЛЕН
 python -c "import dotenv; print('✅ python-dotenv установлен')" 2>nul || echo ❌ python-dotenv НЕ УСТАНОВЛЕН
 
-echo.
-echo ℹ️  Ollama устанавливается отдельно: https://ollama.com/
 echo.
 echo ✅ Установка завершена!
 echo.

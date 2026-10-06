@@ -2,14 +2,10 @@
 python-docx>=1.0.0
 pyperclip>=1.8.0
 
-# Для Ollama (опционально)
-requests>=2.31.0
-
 # Для GigaChat
 gigachat>=0.2.0
 python-dotenv>=1.0.0
+requests>=2.31.0
 
 # Для сборки EXE (опционально)
 # pyinstaller>=6.0.0
-
-# Ollama устанавливается отдельно: https://ollama.com/

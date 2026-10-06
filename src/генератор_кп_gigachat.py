@@ -5,10 +5,11 @@
 Генератор коммерческих предложений с ИИ (GigaChat)
 Версия: 1.0
 
-Отличия от версии с Ollama:
+Особенности:
   * Генерация через облачный GigaChat (src/llm_provider.py)
   * Предпросмотр строится в отдельном потоке — окно не «зависает»
   * Если GigaChat недоступен/вернул None — автоматический fallback на шаблоны
+  * Маршрут, оплата и НДС подставляются из настроек программы, а не моделью
 
 Безопасность: ключ читается только из .env и НИКОГДА не пишется в лог.
 """
@@ -34,10 +35,13 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 # Импортируем общий модуль: пути проекта и логгер
 from logger_config import setup_logger, SETTINGS_PATH, PROJECT_ROOT, LOG_FILE as LOG_FILE_HINT
 
-# Единый провайдер LLM (GigaChat + Ollama)
+# Единый провайдер LLM (GigaChat)
 from llm_provider import (
     DEFAULT_GIGACHAT_TIMEOUT,
+    DEFAULT_PAYMENT_KEY,
     DEFAULT_SYSTEM_PROMPT,
+    PAYMENT_LABELS,
+    PAYMENT_TYPES,
     detect_ssl_interception,
     generate_gigachat,
     get_ca_bundle_status,
@@ -46,6 +50,8 @@ from llm_provider import (
     get_status_info,
     has_ssl_error,
     is_gigachat_configured,
+    payment_key_from_label,
+    payment_line,
     sanitize_key,
     save_gigachat_key,
     start_interception_scan,
@@ -124,34 +130,10 @@ GIGACHAT_SYSTEM_PROMPT = (
 )
 
 # ============================================
-# ТИП ОПЛАТЫ (влияет и на промпт ИИ, и на шаблонный текст)
+# ТИП ОПЛАТЫ
 # ============================================
-
-# Ключ -> (надпись в интерфейсе, формулировка для текста КП)
-PAYMENT_TYPES: Dict[str, Tuple[str, str]] = {
-    "beznal_nds": ("Безнал с НДС", "Оплата по безналу (с НДС)."),
-    "beznal": ("Безнал без НДС", "Оплата по безналу (без НДС)."),
-    "cash": ("Наличные", "Оплата наличными (без НДС)."),
-    "discuss": ("Обсуждается", "Оплата обсуждается."),
-}
-PAYMENT_ORDER = list(PAYMENT_TYPES.keys())
-DEFAULT_PAYMENT_KEY = "beznal_nds"
-
-# Надпись для выпадающего списка (по ней же ищем ключ при выборе)
-PAYMENT_LABELS = [label for label, _ in PAYMENT_TYPES.values()]
-
-
-def payment_key_from_label(label: str) -> str:
-    """Превращает надпись из списка в ключ. Неизвестная надпись → оплата по умолчанию."""
-    for key, (shown, _) in PAYMENT_TYPES.items():
-        if shown == label:
-            return key
-    return DEFAULT_PAYMENT_KEY
-
-
-def payment_line(key: str) -> str:
-    """Готовая строка про оплату для текста КП."""
-    return PAYMENT_TYPES.get(key, PAYMENT_TYPES[DEFAULT_PAYMENT_KEY])[1]
+# Сами константы (PAYMENT_TYPES, PAYMENT_ORDER, DEFAULT_PAYMENT_KEY, payment_line)
+# живут в llm_provider — единый источник истины для интерфейса и текста.
 
 # Значения, которые считаем «ключ не задан» (для отчёта диагностики).
 # Держим копию списка из llm_provider: GUI не должен зависеть от приватных
@@ -334,9 +316,9 @@ LEGALS = [
     "📋 Работаем по договору, оплата без задержек.",
     "📄 Заключаем договор, выплаты строго в срок.",
     "🤝 Официальное оформление, гарантируем надёжность.",
-    "📑 Работаем официально, с НДС, без просрочек.",
+    "📑 Работаем официально, с закрывающими документами.",
     "📋 Все сделки по договору, выплаты чётко в срок.",
-    "📄 Юридически чистая сделка — договор и закрывающие документы.",
+    "📄 Юридически чистая сделка — договор и документы.",
 ]
 
 CTA = [
@@ -433,6 +415,39 @@ class AICache:
 # ============================================
 
 
+# Заголовки по регионам для ИИ-текста. Маршрут и заголовок программа собирает
+# сама: модель сочиняет только тело объявления, поэтому города и служебные
+# формулировки всегда совпадают с тем, что отмечено на вкладке.
+REGION_HEADERS = {
+    "Юга": "🚛 Лот машин на автовоз: Москва → Юга!",
+    "Владивосток": "🚛 Лот машин на автовоз: Владивосток → по России!",
+    "Восток": "🚛 Лот машин на автовоз: Москва → Восток!",
+}
+DEFAULT_REGION_HEADER = "🚛 Лот машин на автовоз!"
+
+
+def build_lot_header(region: str) -> str:
+    """Заголовок объявления для региона."""
+    return REGION_HEADERS.get(region, DEFAULT_REGION_HEADER)
+
+
+def build_route_block(cities: List[str]) -> str:
+    """
+    Собирает блок маршрута для текста КП.
+
+    Маршрут строит КОД, а не модель: города с вкладки известны точно, а ИИ
+    может их перепутать, дописать лишние или потерять часть. Заодно формат
+    «Погрузка: X + Y» всегда одинаковый.
+    """
+    route_cities = [c for c in cities if c != CREATIVE_MODE]
+    if not route_cities:
+        return ""
+
+    cities_line = " + ".join(route_cities)
+    origin = "Владивосток" if all("Владивосток" in c for c in route_cities) else "Москва"
+    return f"📍 Погрузка: {origin}\n📍 Выгрузка: {cities_line}"
+
+
 def _build_prompt(region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT_KEY) -> str:
     """
     Короткий промпт: меньше входных токенов — быстрее ответ.
@@ -443,6 +458,9 @@ def _build_prompt(region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT
     Специфика автовозов передана явно: машины в лоте — это груз, который ждёт
     автовоз. Без этого модель писала «авто готовы к отправке», и текст читался
     как предложение наших грузовиков, а не лота для перевозчика.
+
+    Маршрут подставляется готовым блоком: модель его не сочиняет, а только
+    обрамляет — так города в тексте гарантированно совпадают с вкладкой.
     """
     region_map = {
         "Юга": "юг России (Ростов, Краснодар, Новороссийск)",
@@ -450,18 +468,34 @@ def _build_prompt(region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT
         "Восток": "Урал, Сибирь, Дальний Восток",
     }
     region_desc = region_map.get(region, region)
-    cities_str = ", ".join(cities) if cities else "все города"
+    route_block = build_route_block(cities)
+    pay = payment_line(pay_key)
+
+    if route_block:
+        lot_block = (
+            f"Лот машин (груз) для автовоза, точка А → точка Б: Москва → {region_desc}.\n"
+            f"Города уже указаны в блоке маршрута ниже, придумывать свои нельзя.\n"
+            f"Оплата: {pay}\n"
+        )
+    else:
+        # Креативный режим «Без города»: конкретных городов нет — маршрут
+        # описываем направлением, выдумывать города модели запрещено.
+        lot_block = (
+            f"Лот машин (груз) для автовоза: Москва → {region_desc}.\n"
+            f"Оплата: {pay}\n"
+        )
 
     return (
-        f"Составь коммерческое предложение для перевозчиков-автовозов. "
-        f"Лот машин (груз) нужно перевезти автовозом: Москва → {region_desc}. "
-        f"Города: {cities_str}. "
-        f"Оплата: {payment_line(pay_key)} "
-        f"Требования: начни с эмодзи 🚛 и слов «Лот машин на автовоз»; "
-        f"покажи маршрут «Погрузка: X → Выгрузка: Y»; одна фраза про то, что машины "
-        f"ждут автовоз (🚗); тип оплаты (💰); призыв писать в личку (✍️). "
-        f"4-5 строк, без markdown и без пояснений. "
-        f"ЗАПРЕЩЕНО писать цену, количество машин и названия машин."
+        f"Составь строки для объявления перевозчикам-автовозам.\n"
+        f"{lot_block}"
+        f"Верни РОВНО три строки, каждая со своим эмодзи:\n"
+        f"🚗 — короткое живое предложение (до 12 слов) о том, что машины ждут автовоз; "
+        f"города в этой строке не называй;\n"
+        f"💰 — текст оплаты из условия выше, слово в слово;\n"
+        f"✍️ — короткий призыв писать в личку.\n"
+        f"Без заголовка, без маршрута, без markdown, без пояснений: "
+        f"маршрут и заголовок добавит программа. "
+        f"НЕ упоминай: города, цену, количество машин, названия и марки машин."
     )
 
 
@@ -499,6 +533,116 @@ def generate_with_gigachat(
 
     logger.info("✅ GigaChat сгенерировал текст за %.2f сек (%d символов)", elapsed, len(text))
     return AIGuard.fix_ai_response(text)
+
+
+# ============================================
+# СБОРКА ТЕЛА ОБЪЯВЛЕНИЯ (данные подставляет код, а не ИИ)
+# ============================================
+
+# Строки, которые модель иногда добавляет сама, хотя их место занимает код.
+# Если такую строку оставить, в тексте появится второй маршрут или «оплата»
+# без НДС — то есть именно то, от чего мы уходим.
+_ROUTE_LINE_MARKERS = (
+    "погрузка",
+    "выгрузка",
+    "маршрут",
+    "точка а",
+    "точка б",
+    "загрузка:",
+    "→",
+    "->",
+    "—>",
+)
+_PAY_LINE_MARKERS = (
+    "оплата",
+    "оплату",
+    "оплате",
+    "безнал",
+    "наличн",
+    "ндс",
+    "предоплат",
+)
+
+
+def _iter_body_lines(text: str) -> List[str]:
+    """
+    Разбивает ответ модели на строки, попутно снимая markdown и декор.
+
+    Модель любит дописывать украшения вроде «🌿» или «ждет» без ё — для
+    объявления это мусор, поэтому чистим здесь, а не в шаблонах.
+    """
+    cleaned = AIGuard.fix_ai_response(text)
+    lines = []
+    for raw in cleaned.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-•*—\d.)\s]+", "", line).strip()
+        # Пробелы перед знаками препинания и «ждет» без ё — частая мелочь модели
+        line = re.sub(r"\s+([,.!?…])", r"\1", line)
+        line = line.replace("ждет", "ждёт").replace("Ждет", "Ждёт")
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _strip_decorative_emoji(line: str, keep: str) -> str:
+    """
+    Убирает из строки эмодзи, кроме «своего» (например, 🚗 для статуса).
+
+    ИИ добавляет 🌿, ✨, 🚚 и прочее — в коротком объявлении это выглядит
+    случайным набором картинок. Кириллица и пунктуация не затрагиваются.
+    """
+    allowed = set(keep)
+    return "".join(
+        ch
+        for ch in line
+        if ch in allowed
+        or not (0x1F000 <= ord(ch) <= 0x1FAFF or 0x2600 <= ord(ch) <= 0x27BF)
+    ).strip()
+
+
+def build_body_from_ai(text: str, pay_key: str) -> Tuple[str, str, str]:
+    """
+    Превращает ответ модели в три строки тела: 🚗 статус, 💰 оплата, ✍️ призыв.
+
+    Маршрут и оплата — данные, а не креатив. Модель их периодически путает:
+    вписывает свои города или теряет строку про оплату вместе с НДС. Поэтому
+    берём от неё только фразу-статус, а оплату и призыв ставим сами —
+    из исходных данных, слово в слово.
+    """
+    status_line = ""
+    cta_line = ""
+
+    for line in _iter_body_lines(text):
+        low = line.lower()
+
+        # Строку с маршрутом или оплатой моделью игнорируем: маршрут добавит
+        # код, оплата тоже подставляется из настроек.
+        if any(marker in low for marker in _ROUTE_LINE_MARKERS):
+            continue
+        if any(marker in low for marker in _PAY_LINE_MARKERS):
+            continue
+
+        if not status_line and ("🚗" in line or "машин" in low or "авто" in low):
+            status_line = line
+            continue
+        if not cta_line and ("✍" in line or "пиш" in low or "лич" in low):
+            cta_line = line
+
+    # Статус — единственное место с творчеством. Если модель не дала внятной
+    # фразы, берём шаблонную: текст всё равно останется про автовоз.
+    if status_line:
+        status_line = _strip_decorative_emoji(status_line, "🚗")
+    if len(status_line) < 15 or "автовоз" not in status_line.lower():
+        status_line = random.choice(STATUSES)
+
+    if cta_line:
+        cta_line = _strip_decorative_emoji(cta_line, "✍️")
+    if len(cta_line) < 5:
+        cta_line = random.choice(CTA)
+
+    return status_line, payment_line(pay_key), cta_line
 
 
 # ============================================
@@ -624,16 +768,36 @@ def generate_text_sync(
         ai_text = generate_with_gigachat(region, route_cities, pay_key)
 
         if ai_text:
+            # Заголовок, маршрут и оплату подставляет код, а не модель: у ИИ
+            # берём только фразу-статус. Иначе в тексте появлялись чужие города
+            # или пропадала строка оплаты вместе с упоминанием НДС.
+            status_line, pay_line_text, cta_line = build_body_from_ai(ai_text, pay_key)
+            route_block = build_route_block(route_cities)
+            if route_block:
+                result = (
+                    f"{build_lot_header(region)}\n\n"
+                    f"{route_block}\n\n"
+                    f"{status_line}\n"
+                    f"💰 {pay_line_text}\n"
+                    f"{cta_line}"
+                )
+            else:
+                # Креативный режим: конкретных городов нет, маршрут не выводим
+                result = (
+                    f"{build_lot_header(region)}\n\n"
+                    f"{status_line}\n"
+                    f"💰 {pay_line_text}\n"
+                    f"{cta_line}"
+                )
+
             if use_cache:
-                AICache.set(cache_key, ai_text)
+                AICache.set(cache_key, result)
             # Парная запись к «🔄 Использован шаблонный текст» ниже.
             # Без неё по логу нельзя было понять, что текст пришёл от ИИ:
             # успешный путь не логировался вообще, и казалось, что программа
             # всегда работает на шаблонах.
-            logger.info("✅ Использован ИИ-текст")
-            if cities_text:
-                return f"{ai_text}\n\n{cities_text}"
-            return ai_text
+            logger.info("✅ Использован ИИ-текст (тело от GigaChat, данные — из настроек)")
+            return result
 
     elif USE_AI and not GIGACHAT_READY:
         logger.warning("ИИ включён, но GigaChat не настроен — использую шаблоны")
@@ -1354,25 +1518,6 @@ def _build_diagnostics_report() -> str:
         ca_ok = bool(status.get("found")) or bool(status.get("explicit_valid"))
     except Exception:
         ca_ok = False
-
-    # ---------- Локальный Ollama ----------
-    # Проверяем его только здесь: это сетевой запрос с таймаутом, и при
-    # незапущенном Ollama он ждёт несколько секунд. Диагностика и без того
-    # идёт в фоновом потоке, а вот при построении окна такая проверка
-    # задерживала бы запуск программы.
-    try:
-        ollama = get_status_info(include_ollama=True)
-        if ollama.get("ollama_available"):
-            models = ", ".join(ollama.get("ollama_models") or []) or "—"
-            lines.append(f"✅ Ollama (локальный ИИ): доступен, модели: {models}")
-        else:
-            lines.append(
-                "ℹ️ Ollama (локальный ИИ): не запущен — для версии с GigaChat это нормально"
-            )
-        lines.append("")
-    except Exception as exc:
-        lines.append(f"ℹ️ Ollama: проверить не удалось ({exc})")
-        lines.append("")
 
     if not GIGACHAT_READY:
         lines.append("📊 Итог: программа запустится, но ИИ выключен —")

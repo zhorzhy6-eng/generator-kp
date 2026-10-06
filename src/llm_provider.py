@@ -4,9 +4,11 @@
 """
 Универсальный провайдер LLM для «Генератора КП».
 
-Поддерживает два бэкенда:
+Бэкенд один:
   * GigaChat (облачный, Сбер) — ключ берётся ТОЛЬКО из .env
-  * Ollama   (локальный)      — http://localhost:11434
+
+Локальный Ollama из проекта удалён: он требовал отдельной установки на каждой
+машине, а программа собирается в EXE и работает у перевозчиков «из коробки».
 
 Принципы безопасности:
   * API-ключ никогда не логируется: любые упоминания маскируются как "***"
@@ -1531,9 +1533,36 @@ DEFAULT_GIGACHAT_BASE_URL = "https://gigachat.devices.sberbank.ru/api/v1"
 _GIGACHAT_ATTEMPTS = 2
 _GIGACHAT_RETRY_DELAY = 1.5
 
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "llama3.2"
-DEFAULT_OLLAMA_TIMEOUT = 20
+# ============================================
+# ТИП ОПЛАТЫ (специфика лотов для автовозов)
+# ============================================
+# Ключ -> (надпись в интерфейсе, формулировка для текста КП).
+# Ключи попадают в settings.json, поэтому менять их без миграции не стоит.
+PAYMENT_TYPES = {
+    "beznal_nds": ("Безнал с НДС", "Оплата по безналу (с НДС)."),
+    "beznal": ("Безнал без НДС", "Оплата по безналу (без НДС)."),
+    "cash": ("Наличные", "Оплата наличными (без НДС)."),
+    "discuss": ("Обсуждается", "Оплата обсуждается — безнал с НДС или наличные."),
+}
+PAYMENT_ORDER = list(PAYMENT_TYPES.keys())
+DEFAULT_PAYMENT_KEY = "beznal_nds"
+
+# Надписи для выпадающего списка (по ним же ищем ключ при выборе)
+PAYMENT_LABELS = [label for label, _ in PAYMENT_TYPES.values()]
+
+
+def payment_key_from_label(label: str) -> str:
+    """Превращает надпись из списка в ключ. Неизвестная надпись → оплата по умолчанию."""
+    for key, (shown, _) in PAYMENT_TYPES.items():
+        if shown == label:
+            return key
+    return DEFAULT_PAYMENT_KEY
+
+
+def payment_line(key: str) -> str:
+    """Готовая строка про оплату для текста КП."""
+    return PAYMENT_TYPES.get(key, PAYMENT_TYPES[DEFAULT_PAYMENT_KEY])[1]
+
 
 # Значения, которые считаем «ключ не задан»
 _PLACEHOLDER_VALUES = {
@@ -2339,144 +2368,19 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 # ============================================
-# OLLAMA — ПРОВЕРКА И ГЕНЕРАЦИЯ
-# ============================================
-
-
-def _ollama_host() -> str:
-    return os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST).rstrip("/")
-
-
-def get_ollama_models(timeout: float = 2.0) -> List[str]:
-    """Возвращает список доступных моделей Ollama (пустой список при ошибке)."""
-    try:
-        import requests
-
-        response = requests.get(f"{_ollama_host()}/api/tags", timeout=timeout)
-        if response.status_code == 200:
-            return [m.get("name", "") for m in response.json().get("models", [])]
-        return []
-    except Exception:
-        return []
-
-
-def is_ollama_available(timeout: float = 2.0) -> bool:
-    """Проверяет, запущен ли Ollama и есть ли хотя бы одна модель."""
-    models = get_ollama_models(timeout=timeout)
-    if models:
-        return True
-
-    # Сервер может быть запущен, но без моделей — проверим сам факт доступности
-    try:
-        import requests
-
-        response = requests.get(f"{_ollama_host()}/api/tags", timeout=timeout)
-        return response.status_code == 200 and bool(response.json().get("models"))
-    except Exception:
-        return False
-
-
-def generate_ollama(
-    prompt: str,
-    model: Optional[str] = None,
-    temperature: float = 0.8,
-    timeout: int = DEFAULT_OLLAMA_TIMEOUT,
-    max_tokens: int = 300,
-    system_prompt: Optional[str] = None,
-) -> Optional[str]:
-    """
-    Генерирует текст через локальный Ollama.
-
-    Returns:
-        Текст ответа или None при любой ошибке. Исключения не выбрасываются.
-    """
-    if not prompt or not str(prompt).strip():
-        logger.warning("generate_ollama: пустой prompt")
-        return None
-
-    try:
-        import requests
-    except ImportError:
-        logger.error("Библиотека requests не установлена — Ollama недоступен")
-        return None
-
-    models = get_ollama_models()
-    if not models:
-        logger.warning("generate_ollama: Ollama недоступен или нет моделей")
-        return None
-
-    if not model or model not in models:
-        model = models[0]
-        logger.info("Автоматически выбрана модель Ollama: %s", model)
-
-    try:
-        temperature = float(temperature)
-    except (TypeError, ValueError):
-        temperature = 0.8
-
-    payload: Dict[str, Any] = {
-        "model": model,
-        "prompt": str(prompt),
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "top_p": 0.9,
-            "top_k": 50,
-            "num_predict": int(max_tokens),
-            "repeat_penalty": 1.2,
-        },
-    }
-    if system_prompt:
-        payload["system"] = system_prompt
-
-    start = time.time()
-    try:
-        response = requests.post(
-            f"{_ollama_host()}/api/generate", json=payload, timeout=timeout
-        )
-        elapsed = time.time() - start
-        logger.info(
-            "Ollama: ответ за %.2f сек (HTTP %s, модель %s)",
-            elapsed,
-            response.status_code,
-            model,
-        )
-
-        if response.status_code != 200:
-            logger.error("Ollama вернул HTTP %s", response.status_code)
-            return None
-
-        text = (response.json().get("response") or "").strip()
-        if not text:
-            logger.warning("Ollama вернул пустой ответ")
-            return None
-
-        return text
-
-    except requests.Timeout:
-        logger.error("Таймаут запроса к Ollama (%s сек)", timeout)
-        return None
-    except Exception as e:
-        logger.error("Ошибка запроса к Ollama: %s", scrub_text(str(e)))
-        return None
-
-
-# ============================================
 # ЕДИНАЯ ТОЧКА ВХОДА
 # ============================================
 
 
 def get_available_provider() -> str:
     """
-    Определяет лучший доступный провайдер.
+    Определяет доступный провайдер.
 
     Returns:
-        "gigachat" | "ollama" | "none"
+        "gigachat" | "none"
     """
     if is_gigachat_configured():
         return "gigachat"
-    if is_ollama_available():
-        return "ollama"
     return "none"
 
 
@@ -2486,69 +2390,30 @@ def generate_text(
     system_prompt: Optional[str] = None,
     temperature: float = 0.85,
     max_tokens: int = 280,
-    ollama_model: Optional[str] = None,
-    ollama_timeout: int = DEFAULT_OLLAMA_TIMEOUT,
 ) -> Optional[str]:
     """
     Единая точка генерации текста.
 
-    provider="gigachat" — GigaChat, при неудаче автоматический откат на Ollama
-    provider="ollama"   — только Ollama
-    provider="auto"     — GigaChat, если настроен, иначе Ollama
+    provider="gigachat" — GigaChat
+    provider="auto"     — то же самое: других бэкендов в проекте нет
 
     Returns:
-        Текст или None, если оба провайдера не сработали.
+        Текст или None, если GigaChat не сработал.
     """
-    if provider == "auto":
-        provider = get_available_provider()
-
-    if provider == "gigachat":
-        result = generate_gigachat(
+    if provider in ("auto", "gigachat"):
+        return generate_gigachat(
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        if result:
-            return result
 
-        logger.info("GigaChat не дал результат — пробую Ollama как запасной вариант")
-        return generate_ollama(
-            prompt=prompt,
-            model=ollama_model,
-            temperature=temperature,
-            timeout=ollama_timeout,
-            max_tokens=max_tokens,
-            system_prompt=system_prompt,
-        )
-
-    if provider == "ollama":
-        return generate_ollama(
-            prompt=prompt,
-            model=ollama_model,
-            temperature=temperature,
-            timeout=ollama_timeout,
-            max_tokens=max_tokens,
-            system_prompt=system_prompt,
-        )
-
-    logger.warning("generate_text: нет доступного провайдера (provider=%s)", provider)
+    logger.warning("generate_text: неизвестный провайдер (provider=%s)", provider)
     return None
 
 
-def get_status_info(include_ollama: bool = False) -> Dict[str, Any]:
-    """
-    Краткая сводка о состоянии провайдеров — для логов и UI.
-
-    Args:
-        include_ollama: проверять ли локальный сервер Ollama. По умолчанию
-            НЕТ, потому что проверка — это сетевой запрос к localhost:11434,
-            который при незапущенном Ollama ждёт таймаут (до 2 секунд, а на
-            Windows с антивирусом заметно дольше). Функция вызывается при
-            построении интерфейса, поэтому по умолчанию она работает только
-            с файлами и переменными окружения. Версия с GigaChat данные
-            Ollama не использует, а диагностика запрашивает их явно.
-    """
+def get_status_info() -> Dict[str, Any]:
+    """Краткая сводка о состоянии провайдера — для логов и UI."""
     try:
         model = os.environ.get("GIGACHAT_MODEL", DEFAULT_GIGACHAT_MODEL)
     except Exception:
@@ -2558,16 +2423,10 @@ def get_status_info(include_ollama: bool = False) -> Dict[str, Any]:
     found_ca = find_ca_bundle()
     env_file = ENV_FILE or find_env_file()
 
-    ollama_available = is_ollama_available() if include_ollama else False
-    ollama_models = get_ollama_models() if include_ollama else []
-
     return {
         "gigachat_configured": is_gigachat_configured(),
         "gigachat_model": model,
         "gigachat_credentials": mask_credentials(get_gigachat_credentials()),
-        "ollama_available": ollama_available,
-        "ollama_models": ollama_models,
-        "ollama_checked": include_ollama,
         "env_path": str(env_file) if env_file else str(get_env_write_path()),
         "env_exists": bool(env_file and env_file.exists()),
         "env_found_paths": [str(p) for p in _env_search_paths()],
@@ -2623,8 +2482,6 @@ if __name__ == "__main__":
     print(f"GigaChat настроен:    {'✅ да' if info['gigachat_configured'] else '❌ нет'}")
     print(f"GigaChat credentials: {info['gigachat_credentials']}")
     print(f"GigaChat модель:      {info['gigachat_model']}")
-    print(f"Ollama доступен:      {'✅ да' if info['ollama_available'] else '❌ нет'}")
-    print(f"Ollama модели:        {', '.join(info['ollama_models']) or '—'}")
     print(f"Активный провайдер:   {get_available_provider()}")
     print()
     print(f"Сертификат Минцифры:  {info['ca_bundle'] or '— не задан —'}")
