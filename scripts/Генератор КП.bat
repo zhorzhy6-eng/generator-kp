@@ -68,7 +68,7 @@ if errorlevel 1 (
 
 REM Проверяем наличие библиотек
 echo ⏳ Проверка библиотек...
-python -c "import docx, pyperclip, tkinter" >nul 2>&1
+python -c "import docx, pyperclip, tkinter, customtkinter" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo ⚠️ ВНИМАНИЕ: Не все библиотеки установлены!
@@ -136,11 +136,11 @@ if errorlevel 1 (
 )
 
 echo ✅ Ключ найден, библиотеки проверяются...
-python -c "import gigachat, dotenv" >nul 2>&1
+python -c "import gigachat, dotenv, customtkinter" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo ⚠️  Библиотеки GigaChat не установлены!
-    echo    Установите их: pip install gigachat python-dotenv
+    echo    Установите их: pip install gigachat python-dotenv customtkinter
     echo    Или выберите пункт 3 меню.
     echo.
     pause
@@ -246,7 +246,7 @@ python -m pip install --upgrade pip
 echo.
 
 echo ⏳ Установка библиотек...
-pip install python-docx pyperclip requests gigachat python-dotenv
+pip install python-docx pyperclip customtkinter requests gigachat python-dotenv
 echo.
 
 echo ⏳ Проверка установленных библиотек...
@@ -254,6 +254,7 @@ echo.
 python -c "import docx; print('✅ python-docx установлен')" 2>nul || echo ❌ python-docx НЕ УСТАНОВЛЕН
 python -c "import pyperclip; print('✅ pyperclip установлен')" 2>nul || echo ❌ pyperclip НЕ УСТАНОВЛЕН
 python -c "import tkinter; print('✅ tkinter установлен')" 2>nul || echo ❌ tkinter НЕ УСТАНОВЛЕН
+python -c "import customtkinter; print('✅ customtkinter установлен')" 2>nul || echo ❌ customtkinter НЕ УСТАНОВЛЕН
 python -c "import requests; print('✅ requests установлен')" 2>nul || echo ❌ requests НЕ УСТАНОВЛЕН
 python -c "import gigachat; print('✅ gigachat установлен')" 2>nul || echo ❌ gigachat НЕ УСТАНОВЛЕН
 python -c "import dotenv; print('✅ python-dotenv установлен')" 2>nul || echo ❌ python-dotenv НЕ УСТАНОВЛЕН

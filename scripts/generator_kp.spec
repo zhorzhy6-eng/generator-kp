@@ -35,7 +35,7 @@
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 # ---------- Корень проекта ----------
 # spec-файл лежит в <корень>/scripts/, поэтому корень — на уровень выше.
@@ -70,6 +70,8 @@ hiddenimports += [
     "tkinter.messagebox",
     "tkinter.filedialog",
     "tkinter.scrolledtext",
+    # Интерфейс собран на CustomTkinter — библиотека обязана попасть в сборку
+    "customtkinter",
     "logger_config",
     "llm_provider",
 ]
@@ -78,6 +80,16 @@ hiddenimports += [
 # ВАЖНО: .env (с настоящим ключом) НИКОГДА не упаковывается в .exe.
 # Кладём только .env.example как образец.
 datas = []
+
+# Ресурсы CustomTkinter: файлы тем (blue.json, green.json, dark-blue.json),
+# шрифты Roboto и иконка окна. Библиотека читает их со своего диска при
+# создании окна — без этих файлов программа падает сразу при запуске.
+try:
+    ctk_datas = collect_data_files("customtkinter")
+    datas += ctk_datas
+    print(f"[spec] Ресурсы CustomTkinter: {len(ctk_datas)} файлов")
+except Exception as exc:  # pragma: no cover
+    print(f"[spec] ВНИМАНИЕ: не удалось собрать ресурсы customtkinter: {exc}")
 
 env_example = os.path.join(PROJECT_ROOT, ".env.example")
 if os.path.isfile(env_example):

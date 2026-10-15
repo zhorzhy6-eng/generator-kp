@@ -3,31 +3,39 @@
 
 """
 Генератор коммерческих предложений с ИИ (GigaChat)
-Версия: 1.0
+Версия: 2.0 — интерфейс на CustomTkinter
 
 Особенности:
   * Генерация через облачный GigaChat (src/llm_provider.py)
   * Предпросмотр строится в отдельном потоке — окно не «зависает»
   * Если GigaChat недоступен/вернул None — автоматический fallback на шаблоны
   * Маршрут, оплата и НДС подставляются из настроек программы, а не моделью
+  * Выбор городов запоминается ОТДЕЛЬНО для каждого региона (cities_by_region):
+    раньше при переключении вкладки выбор предыдущего региона затирался
 
 Безопасность: ключ читается только из .env и НИКОГДА не пишется в лог.
+
+Интерфейс: только CustomTkinter (тёмная тема). Чистый tkinter оставлен там,
+где он и должен быть: messagebox, filedialog и переменные (IntVar/StringVar) —
+они работают поверх CustomTkinter без конфликтов.
 """
 
-import pyperclip
-import tkinter as tk
-from tkinter import messagebox, Checkbutton, IntVar, ttk
-from datetime import datetime
+import json
 import os
 import random
-import json
 import re
 import sys
 import threading
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import customtkinter as ctk
+import pyperclip
+import tkinter as tk
+from tkinter import messagebox
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -57,6 +65,48 @@ from llm_provider import (
     start_interception_scan,
     warmup_gigachat,
 )
+
+# ============================================
+# ОФОРМЛЕНИЕ (CustomTkinter)
+# ============================================
+# Тема и цветовая схема задаются ДО создания окна: CustomTkinter читает их
+# при создании первого виджета.
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("green")
+
+# Палитра окна. Одна гамма на весь интерфейс: иначе кнопки, карточки и
+# статус-бар «разъезжаются» по оттенкам и выглядят собранными из разных программ.
+BG_WINDOW = "#12151a"      # фон окна
+BG_CARD = "#1b1f27"        # карточки (колонки настроек и предпросмотра)
+BG_HEADER = "#171b22"      # шапка
+BG_STATUS = "#0e1116"      # статус-бар
+TEXT_MAIN = "#e9ecf1"      # основной текст
+TEXT_DIM = "#98a2b3"       # пояснения и подписи
+
+COLOR_PRIMARY = "#2e7d32"       # главное действие (применить, копировать)
+COLOR_PRIMARY_HOVER = "#256428"
+COLOR_ACCENT = "#1565c0"        # Word, служебные действия
+COLOR_ACCENT_HOVER = "#11519c"
+COLOR_VIOLET = "#7b1fa2"        # «показать новый вариант»
+COLOR_VIOLET_HOVER = "#641a84"
+COLOR_WARN = "#ef6c00"          # варианты, предупреждения
+COLOR_WARN_HOVER = "#c85b00"
+COLOR_DANGER = "#c62828"        # выход, SSL
+COLOR_DANGER_HOVER = "#a42020"
+COLOR_TOOL = "#37474f"          # служебные кнопки шапки
+COLOR_TOOL_HOVER = "#2c3a41"
+COLOR_AI_ON = "#2e7d32"
+COLOR_AI_OFF = "#c62828"
+
+# text_color для надписи о состоянии GigaChat
+COLOR_TEXT_OK = "#66bb6a"
+COLOR_TEXT_ERR = "#ef5350"
+COLOR_TEXT_WARN = "#ffb74d"
+
+# Ширина левой колонки с настройками: фиксированная, чтобы предпросмотр
+# «не прыгал» при переключении вкладок.
+LEFT_COLUMN_WIDTH = 380
 
 # Настраиваем логгер
 logger = setup_logger(__name__)
@@ -98,7 +148,7 @@ except Exception:  # pragma: no cover
     pass
 
 logger.info("=" * 70)
-logger.info("ЗАПУСК ГЕНЕРАТОРА КП С GIGACHAT")
+logger.info("ЗАПУСК ГЕНЕРАТОРА КП С GIGACHAT (интерфейс CustomTkinter)")
 logger.info("=" * 70)
 logger.info(
     "Режим запуска: %s | Python %s",
@@ -159,6 +209,10 @@ _diag_widgets: Dict[str, object] = {}
 
 SETTINGS_FILE = SETTINGS_PATH
 
+# Регионы (они же — вкладки выбора городов). Порядок важен: он же порядок вкладок.
+REGIONS = ("Юга", "Владивосток", "Восток")
+DEFAULT_REGION = "Юга"
+
 # Статус GigaChat определяем один раз при старте (ключ читается из .env)
 GIGACHAT_READY = is_gigachat_configured()
 STATUS_INFO = get_status_info()
@@ -174,12 +228,60 @@ logger.info(
 
 
 def load_settings():
-    """Загружает настройки из файла"""
+    """Загружает настройки из файла (сырой словарь или None)."""
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
+
+
+def _normalize_region(value) -> str:
+    """
+    Приводит название региона из настроек к одному из REGIONS.
+
+    В старых/битых settings.json там могло оказаться что угодно — программа
+    не должна из-за этого падать или показывать пустую вкладку.
+    """
+    text = str(value or "").strip()
+    for region in REGIONS:
+        if text.lower() == region.lower():
+            return region
+    return DEFAULT_REGION
+
+
+def _read_cities_by_region(saved: Optional[dict]) -> Dict[str, List[str]]:
+    """
+    Достаёт выбор городов по регионам, ПЕРЕНОСЯ старый формат настроек.
+
+    Новый формат: {"cities_by_region": {"Юга": [...], "Владивосток": [...], ...}}
+    Старый формат: {"cities": [...], "region": "Юга"} — один список на всё.
+
+    Миграция обязательна: у пользователей уже лежит старый settings.json,
+    и при обновлении программы их выбор не должен пропасть.
+    """
+    result: Dict[str, List[str]] = {}
+    if not saved:
+        return result
+
+    raw = saved.get("cities_by_region")
+    if isinstance(raw, dict):
+        for region, cities in raw.items():
+            if str(region) in REGIONS and isinstance(cities, list):
+                result[str(region)] = [str(city) for city in cities]
+        if result:
+            return result
+
+    legacy_cities = saved.get("cities")
+    if isinstance(legacy_cities, list):
+        legacy_region = _normalize_region(saved.get("region"))
+        result[legacy_region] = [str(city) for city in legacy_cities]
+        logger.info(
+            "Настройки: старый формат перенесён в cities_by_region[%s] (%d городов)",
+            legacy_region,
+            len(result[legacy_region]),
+        )
+    return result
 
 
 def save_settings(
@@ -188,53 +290,85 @@ def save_settings(
     use_ai=True,
     creativity=0.8,
     payment_key: str = DEFAULT_PAYMENT_KEY,
+    cities_map: Optional[Dict[str, List[str]]] = None,
 ):
-    """Сохраняет настройки в файл. Ключи GigaChat здесь НЕ хранятся."""
+    """
+    Сохраняет настройки в файл. Ключи GigaChat здесь НЕ хранятся.
+
+    Выбор городов пишется в двух видах:
+      * cities_by_region — основной формат: свой список для каждого региона;
+      * cities           — выбор ТЕКУЩЕГО региона. Оставлен для совместимости
+        с уже разосланными сборками: старый EXE читает только это поле и без
+        него потерял бы выбор городов.
+
+    Args:
+        cities_map: снимок выбора по регионам. None — берём текущее состояние
+                    из памяти (cities_by_region).
+    """
     try:
+        if cities_map is None:
+            cities_by_region[region] = list(selected_cities)
+            snapshot = dict(cities_by_region)
+        else:
+            snapshot = dict(cities_map)
+            snapshot[region] = list(selected_cities)
+
+        payload = {
+            "cities_by_region": snapshot,
+            "cities": list(selected_cities),
+            "region": region,
+            "use_ai": use_ai,
+            "model": GIGACHAT_MODEL,
+            "creativity": creativity,
+            "payment": payment_key,
+        }
+
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "cities": selected_cities,
-                    "region": region,
-                    "use_ai": use_ai,
-                    "model": GIGACHAT_MODEL,
-                    "creativity": creativity,
-                    "payment": payment_key,
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
         logger.info(
             "Настройки сохранены: регион=%s, городов=%d, оплата=%s",
             region,
             len(selected_cities),
             payment_key,
         )
+        return True
     except Exception as e:
         logger.error("Ошибка сохранения настроек: %s", e)
+        return False
 
 
 # Загружаем сохранённые настройки
 saved = load_settings()
+
+# Выбор городов по регионам (миграция старого формата внутри _read_cities_by_region)
+cities_by_region: Dict[str, List[str]] = _read_cities_by_region(saved)
+
 if saved:
-    SELECTED_CITIES = saved.get("cities", [])
-    CURRENT_REGION = saved.get("region", "Юга")
-    USE_AI = saved.get("use_ai", True)
-    CREATIVITY = saved.get("creativity", 0.8)
+    CURRENT_REGION = _normalize_region(saved.get("region"))
+    USE_AI = bool(saved.get("use_ai", True))
+    try:
+        CREATIVITY = float(saved.get("creativity", 0.8))
+    except (TypeError, ValueError):
+        CREATIVITY = 0.8
+    # Слайдер ограничен диапазоном 0.2…1.0 — держим значение в этих рамках,
+    # иначе ползунок встанет не туда, где написано число.
+    CREATIVITY = min(max(CREATIVITY, 0.2), 1.0)
     PAYMENT_KEY = saved.get("payment", DEFAULT_PAYMENT_KEY)
     if PAYMENT_KEY not in PAYMENT_TYPES:
         # Старый или битый settings.json — не роняем программу, берём умолчание
         PAYMENT_KEY = DEFAULT_PAYMENT_KEY
 else:
-    SELECTED_CITIES = []
-    CURRENT_REGION = "Юга"
+    CURRENT_REGION = DEFAULT_REGION
     USE_AI = True
     CREATIVITY = 0.8
     PAYMENT_KEY = DEFAULT_PAYMENT_KEY
 
 logger.info(
-    "Загружена креативность: %s, тип оплаты: %s", CREATIVITY, PAYMENT_KEY
+    "Загружена креативность: %s, тип оплаты: %s, регион: %s",
+    CREATIVITY,
+    PAYMENT_KEY,
+    CURRENT_REGION,
 )
 
 # ============================================
@@ -280,6 +414,36 @@ ALL_CITIES_EAST = [
 
 CREATIVE_MODE = "✨ Без города (креативный режим)"
 
+# Города по умолчанию для региона, который пользователь ещё не открывал.
+# Для Востока креативный режим сюда НЕ входит: это режим, а не город —
+# раньше при переключении вкладки он отмечался вместе со всеми городами,
+# и в тексте получалось «Без города» плюс список городов.
+DEFAULT_CITIES_BY_REGION: Dict[str, List[str]] = {
+    "Юга": list(ALL_CITIES_SOUTH),
+    "Владивосток": list(ALL_CITIES_VLADIVOSTOK),
+    "Восток": list(ALL_CITIES_EAST),
+}
+
+# Названия вкладок. Регион определяется по названию, а не по номеру вкладки:
+# номера сбиваются, если вкладку когда-нибудь добавят или переставят.
+TAB_TITLES: Dict[str, str] = {
+    "Юга": "📍 Юга",
+    "Владивосток": "📍 Владивосток",
+    "Восток": "📍 Восток",
+}
+TAB_TITLES_BY_NAME: Dict[str, str] = {title: region for region, title in TAB_TITLES.items()}
+
+# Регион, города которого показываются сейчас (для сохранения выбора при
+# переключении вкладок).
+_active_region = CURRENT_REGION
+
+# Если для текущего региона выбора нет вовсе — показываем города региона
+# целиком: так же вела себя прежняя версия при переключении вкладок.
+if CURRENT_REGION not in cities_by_region:
+    cities_by_region[CURRENT_REGION] = list(DEFAULT_CITIES_BY_REGION[CURRENT_REGION])
+
+SELECTED_CITIES = list(cities_by_region[CURRENT_REGION])
+
 # ============================================
 # ВАРИАНТЫ СТИЛЕЙ ДЛЯ FALLBACK-ШАБЛОНОВ
 # ============================================
@@ -287,19 +451,43 @@ CREATIVE_MODE = "✨ Без города (креативный режим)"
 # Специфика проекта: машины в лоте — это ГРУЗ для автовоза. Поэтому в каждой
 # фразе рядом с упоминанием машин стоит контекст «на автовоз»: иначе читатель
 # понимает текст как «наши машины/транспорт готовы ехать».
+#
+# Первая строка объявления зависит от того, один город в лоте или несколько:
+# «одно направление» и «сборный маршрут» — это разные предложения для
+# перевозчика, и раньше текст об этом умалчивал.
 
-OPENERS = [
-    "🚛 Есть лот машин на автовоз!",
-    "🚛 Свежий лот на автовоз — забирайте!",
-    "🚛 Лот машин ждёт автовоз!",
-    "🚛 Автовозам: свежий лот машин!",
-    "🚛 Лот сформирован, ищем автовоз!",
-    "🚛 Груз для автовоза — маршрут ниже!",
-    "🚛 Машины на отправку — нужен автовоз!",
-    "🚛 Новый лот машин под автовоз!",
-    "🚛 Есть машины на перевозку автовозом!",
-    "🚛 Лот машин — загрузка на автовоз!",
+OPENERS_ONE = [
+    "🚛 Есть лот машин на автовоз — направление ниже!",
+    "🚛 Свежий лот на автовоз: одно направление, один рейс!",
+    "🚛 Лот машин ждёт автовоз — выгрузка в одном городе!",
+    "🚛 Автовозам: свежий лот на одно направление!",
+    "🚛 Лот сформирован, ищем автовоз на один город!",
+    "🚛 Машины на отправку — нужен автовоз на точку ниже!",
+    "🚛 Груз для автовоза: одно направление, без перевалок!",
+    "🚛 Новый лот машин под автовоз — один город на выгрузку!",
+    "🚛 Лот машин на автовоз — забирайте одним рейсом!",
+    "🚛 Есть машины на перевозку автовозом — маршрут ниже!",
+    "🚛 Лот машин на одно направление — нужен автовоз!",
+    "🚛 Свежий лот: один город на выгрузку, ищем автовоз!",
 ]
+
+OPENERS_MULTI = [
+    "🚛 Есть лот машин на автовоз — сборный маршрут!",
+    "🚛 Свежий лот на автовоз: несколько городов в одном рейсе!",
+    "🚛 Лот машин ждёт автовоз — маршрут из нескольких точек!",
+    "🚛 Автовозам: сборный лот по нескольким городам!",
+    "🚛 Лот сформирован, ищем автовоз на сборный маршрут!",
+    "🚛 Машины на отправку — нужен автовоз по маршруту ниже!",
+    "🚛 Груз для автовоза: сборный маршрут, несколько городов!",
+    "🚛 Новый лот машин под автовоз — забрать из нескольких точек!",
+    "🚛 Лот машин на автовоз — маршрут с несколькими выгрузками!",
+    "🚛 Сборный лот машин — нужен автовоз на весь маршрут!",
+    "🚛 Лот машин: несколько городов, один автовоз!",
+    "🚛 Есть машины на перевозку автовозом — маршрут ниже!",
+]
+
+# Общий список — на случай, если понадобится выбор без учёта количества городов
+OPENERS = OPENERS_ONE + OPENERS_MULTI
 
 STATUSES = [
     "🚗 Машины готовы к погрузке на автовоз.",
@@ -310,6 +498,20 @@ STATUSES = [
     "🚗 Машины на площадке — нужен автовоз под погрузку.",
     "🚗 Лот машин ждёт автовоз, загрузка быстрая.",
     "🚗 Машины ждут своей очереди на автовоз.",
+    "🚗 Машины на площадке, автовоз нужен сегодня.",
+    "🚗 Лот готов: машины стоят под погрузку на автовоз.",
+    "🚗 Ждём автовоз — машины на площадке, погрузка без ожидания.",
+    "🚗 Машины к отправке готовы, нужен автовоз на рейс.",
+    "🚗 Лот машин собран, автовоз требуется в ближайшие дни.",
+    "🚗 Машины ждут автовоз, погрузка займёт минимум времени.",
+    "🚗 Есть машины на автовоз — погрузка по готовности.",
+    "🚗 Машины на площадке и готовы к погрузке, ищем автовоз.",
+    "🚗 Лот машин ждёт автовоз — загрузка быстрая, без простоев.",
+    "🚗 Машины стоят под погрузку, автовоз нужен срочно.",
+    "🚗 Автовоз требуется: машины готовы, погрузка день в день.",
+    "🚗 Машины ждут автовоз — рейс можно планировать сейчас.",
+    "🚗 Лот машин на площадке, ждём автовоз под загрузку.",
+    "🚗 Машины готовы к отправке автовозом — нужен перевозчик.",
 ]
 
 LEGALS = [
@@ -319,6 +521,20 @@ LEGALS = [
     "📑 Работаем официально, с закрывающими документами.",
     "📋 Все сделки по договору, выплаты чётко в срок.",
     "📄 Юридически чистая сделка — договор и документы.",
+    "⚖️ Работаем по договору, все документы предоставляем.",
+    "🧾 Оплата с полным пакетом закрывающих документов.",
+    "🤝 Договор оформляем сразу, оплата в срок.",
+    "📑 Официальный договор, оплата по факту выгрузки.",
+    "📋 Прозрачные условия: договор, документы, оплата в срок.",
+    "⚖️ Юридическое сопровождение сделки — работаем официально.",
+    "📄 Заявка, договор, документы — всё официально.",
+    "🧾 Закрывающие документы предоставляем в срок.",
+    "📑 Оплата в срок по договору, без задержек и сюрпризов.",
+    "🤝 Договор и полный пакет документов — работаем чисто.",
+    "📋 Оформление официальное, реквизиты и договор сразу.",
+    "⚖️ Работаем прозрачно: договор, счёт, закрывающие.",
+    "📄 Все условия в договоре, оплата без просрочек.",
+    "📑 Закрывающие документы в срок, работаем официально.",
 ]
 
 CTA = [
@@ -328,7 +544,101 @@ CTA = [
     "✍️ Пишите в личку — обсудим ставки и даты.",
     "✍️ Подробности и ставки — только в личку.",
     "✍️ Всё по лоту — в личку. Пишите!",
+    "✍️ Ставки, даты и детали — в личку, отвечаем быстро.",
+    "✍️ Напишите в личку — рассчитаем ставку под ваш рейс.",
+    "✍️ Пишите в личку: обсудим ставку и дату загрузки.",
+    "✍️ Есть свободный автовоз? Пишите в личку — дадим детали.",
+    "✍️ Все условия — в личке, отвечаем оперативно.",
+    "✍️ Ставка и детали по лоту — в личных сообщениях.",
+    "✍️ Пишите — обсудим рейс, ставку и сроки.",
+    "✍️ Детали в личку: города, даты, ставка.",
+    "✍️ Есть вопросы по лоту? Пишите в личку.",
+    "✍️ Связь в личке — ставка и даты там же.",
+    "✍️ Пишите в личку, если готовы взять рейс.",
+    "✍️ Обсудим ставку в личных сообщениях — пишите.",
+    "✍️ Все подробности по лоту — в личке, ждём!",
+    "✍️ Пишите в личку: договоримся по ставке и датам.",
 ]
+
+# ============================================
+# ИСТОРИЯ ФРАЗ (чтобы текст не повторялся)
+# ============================================
+
+
+class RecentHistory:
+    """
+    Помнит последние выданные фразы и не даёт выдать ту же самую подряд.
+
+    Зачем: random.choice из одного списка регулярно выдаёт одну и ту же фразу
+    два раза кряду — со стороны это выглядит как «кнопка не работает, текст не
+    меняется». Здесь у каждого списка своя история: новая фраза выбирается
+    только из тех, что не выдавались последними.
+
+    История хранится в памяти процесса и на диск не пишется: после перезапуска
+    повтор фразы безобиден, а лишний файл состояния — лишняя точка отказа.
+    """
+
+    def __init__(self, depth: int = 3) -> None:
+        self._depth = max(1, int(depth))
+        self._history: Dict[str, List[str]] = {}
+
+    def pick(self, key: str, variants: Sequence[str]) -> str:
+        """
+        Возвращает вариант, которого не было среди последних выданных.
+
+        Args:
+            key:      имя списка («statuses», «cta»…) — история у каждого своя;
+            variants: список фраз.
+
+        Returns:
+            Выбранную фразу. Пустой список — пустую строку (не исключение:
+            вызывающий код подставляет шаблон и не должен падать).
+        """
+        pool = [v for v in variants if v]
+        if not pool:
+            return ""
+        if len(pool) == 1:
+            return pool[0]
+
+        recent = self._history.setdefault(key, [])
+        candidates = [v for v in pool if v not in recent]
+        if not candidates:
+            # Все варианты уже были в недавних — начинаем круг заново.
+            recent.clear()
+            candidates = pool
+
+        choice = random.choice(candidates)
+        recent.append(choice)
+
+        # Держим историю короче самого списка, иначе выбор «не из недавних»
+        # станет невозможным и мы будем каждый раз чистить историю.
+        limit = min(self._depth, max(1, len(pool) - 1))
+        del recent[:-limit]
+        return choice
+
+    def remember(self, key: str, value: str) -> None:
+        """Запоминает фразу, полученную не через pick (например, от ИИ)."""
+        if not value:
+            return
+        recent = self._history.setdefault(key, [])
+        recent.append(value)
+        del recent[:-self._depth]
+
+    def clear(self) -> None:
+        """Забывает всё — например, по кнопке «Кэш»."""
+        self._history.clear()
+
+
+# Единая история фраз для всего модуля
+_PHRASES = RecentHistory()
+
+
+def _pick_opener(city_count: int) -> str:
+    """Открывающая строка: для одного города и для сборного маршрута — разные."""
+    if city_count <= 1:
+        return _PHRASES.pick("openers_one", OPENERS_ONE)
+    return _PHRASES.pick("openers_multi", OPENERS_MULTI)
+
 
 # ============================================
 # ЗАЩИТА ОТ ГАЛЛЮЦИНАЦИЙ ИИ
@@ -461,6 +771,10 @@ def _build_prompt(region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT
 
     Маршрут подставляется готовым блоком: модель его не сочиняет, а только
     обрамляет — так города в тексте гарантированно совпадают с вкладкой.
+
+    В конце дан один пример удачного ответа (few-shot): на нём модель заметно
+    стабильнее держит формат «три строки с эмодзи». Оплата в примере взята
+    настоящая — из настроек, иначе модель копировала бы чужую формулировку.
     """
     region_map = {
         "Юга": "юг России (Ростов, Краснодар, Новороссийск)",
@@ -485,9 +799,19 @@ def _build_prompt(region: str, cities: List[str], pay_key: str = DEFAULT_PAYMENT
             f"Оплата: {pay}\n"
         )
 
+    # Пример удачного ответа. Копировать дословно не нужно — важно, что строк
+    # ровно три, у каждой свой эмодзи и нет ни городов, ни цены.
+    example_block = (
+        "Пример удачного ответа (держи формат и тон, дословно не копируй):\n"
+        "🚗 Машины на площадке, автовоз нужен сегодня — погрузка быстрая.\n"
+        f"💰 {pay}\n"
+        "✍️ Ставка и даты загрузки — в личку, отвечаем сразу.\n"
+    )
+
     return (
         f"Составь строки для объявления перевозчикам-автовозам.\n"
         f"{lot_block}"
+        f"{example_block}"
         f"Верни РОВНО три строки, каждая со своим эмодзи:\n"
         f"🚗 — короткое живое предложение (до 12 слов) о том, что машины ждут автовоз; "
         f"города в этой строке не называй;\n"
@@ -637,6 +961,9 @@ def build_body_from_ai(
     вписывает свои города или теряет строку про оплату вместе с НДС. Поэтому
     берём от неё только фразу-статус, а оплату и призыв ставим сами —
     из исходных данных, слово в слово.
+
+    Запасные фразы берутся через _PHRASES: подряд одна и та же строка не
+    повторится, иначе два сгенерированных текста выглядели бы одинаково.
     """
     status_line = ""
     cta_line = ""
@@ -662,16 +989,16 @@ def build_body_from_ai(
     if status_line:
         status_line = _strip_decorative_emoji(status_line, "🚗")
     if len(status_line) < 15 or "автовоз" not in status_line.lower():
-        status_line = random.choice(STATUSES)
+        status_line = _PHRASES.pick("statuses", STATUSES)
     elif _mentions_route_city(status_line, cities):
         # «…автовоз! Москва—Владивосток, Россия.» — города уже есть в блоке
         # маршрута, в статусе они только создают путаницу.
-        status_line = random.choice(STATUSES)
+        status_line = _PHRASES.pick("statuses", STATUSES)
 
     if cta_line:
         cta_line = _strip_decorative_emoji(cta_line, "✍️")
     if len(cta_line) < 5:
-        cta_line = random.choice(CTA)
+        cta_line = _PHRASES.pick("cta", CTA)
 
     return status_line, payment_line(pay_key), cta_line
 
@@ -682,17 +1009,32 @@ def build_body_from_ai(
 
 
 def get_selected_cities():
-    return [city for city, var in city_vars.items() if var.get() == 1]
+    """
+    Отмеченные города.
+
+    Отметки есть только у текущего региона: при переключении вкладки галочки
+    остальных регионов снимаются (их выбор лежит в cities_by_region).
+    """
+    try:
+        return [city for city, var in city_vars.items() if var.get() == 1]
+    except NameError:
+        # Виджеты ещё не созданы (ранний вызов) — это нормально
+        return []
 
 
 def get_current_region():
-    tab = notebook.index(notebook.select())
-    if tab == 0:
-        return "Юга"
-    elif tab == 1:
-        return "Владивосток"
-    else:
-        return "Восток"
+    """
+    Определяет текущий активный регион по вкладке.
+
+    Регион ищем по НАЗВАНИЮ вкладки, а не по её номеру: номер сбивается,
+    стоит поменять порядок вкладок или добавить новую.
+    """
+    try:
+        tab_name = notebook.get()
+    except Exception:
+        # Виджета ещё нет или окно уже закрыто — отдаём последний известный регион
+        return CURRENT_REGION
+    return TAB_TITLES_BY_NAME.get(tab_name, CURRENT_REGION)
 
 
 def get_payment_key() -> str:
@@ -742,17 +1084,43 @@ def format_cities_list(cities: List[str]) -> str:
     return random.choice(styles)()
 
 
-def build_template_text(cities_text: str, pay_key: str = DEFAULT_PAYMENT_KEY) -> str:
+def _guess_city_count(cities_text: str) -> int:
+    """
+    Прикидывает количество городов по готовой строке маршрута.
+
+    Нужна только для обратной совместимости: если build_template_text вызвали
+    без явного количества городов, выбираем открывающую фразу «на глазок».
+    """
+    if not cities_text:
+        return 0
+    if "\n" in cities_text:
+        return 2
+    if " и " in cities_text or ", " in cities_text:
+        return 2
+    return 1
+
+
+def build_template_text(
+    cities_text: str,
+    pay_key: str = DEFAULT_PAYMENT_KEY,
+    city_count: Optional[int] = None,
+) -> str:
     """
     Fallback: собирает текст из случайных шаблонных фраз.
 
     Структура повторяет то, что мы требуем от ИИ: заголовок с автовозом,
     маршрут, фраза про ожидание автовоза, оплата и призыв в личку.
+
+    Args:
+        cities_text: уже отформатированный список городов (может быть пустым);
+        pay_key:     тип оплаты;
+        city_count:  сколько городов в лоте. Если None — оцениваем по тексту.
     """
-    opener = random.choice(OPENERS)
-    status = random.choice(STATUSES)
-    legal = random.choice(LEGALS)
-    cta = random.choice(CTA)
+    count = _guess_city_count(cities_text) if city_count is None else int(city_count)
+    opener = _pick_opener(count)
+    status = _PHRASES.pick("statuses", STATUSES)
+    legal = _PHRASES.pick("legals", LEGALS)
+    cta = _PHRASES.pick("cta", CTA)
     pay = payment_line(pay_key)
 
     if cities_text:
@@ -836,7 +1204,7 @@ def generate_text_sync(
         logger.warning("ИИ включён, но GigaChat не настроен — использую шаблоны")
 
     logger.info("🔄 Использован шаблонный текст (fallback)")
-    return build_template_text(cities_text, pay_key)
+    return build_template_text(cities_text, pay_key, len(route_cities))
 
 
 # ============================================
@@ -845,6 +1213,29 @@ def generate_text_sync(
 
 _generation_lock = threading.Lock()
 _generation_in_progress = False
+
+
+def _set_progress_visible(visible: bool) -> None:
+    """
+    Показывает/прячет анимированный прогресс-бар.
+
+    Полоса «ползёт» (режим indeterminate) всё время, пока идёт фоновая
+    генерация: по ней видно, что программа работает, а не зависла.
+    """
+    try:
+        if visible:
+            if not progress_bar.winfo_manager():
+                progress_bar.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 0))
+            progress_bar.start()
+        else:
+            progress_bar.stop()
+            if progress_bar.winfo_manager():
+                progress_bar.grid_remove()
+    except NameError:
+        # Прогресс-бар ещё не создан (ранний вызов при старте) — это нормально
+        pass
+    except Exception as exc:  # pragma: no cover — прогресс не критичен
+        logger.debug("Не удалось переключить прогресс-бар: %s", exc)
 
 
 def _set_busy(busy: bool, message: str = "") -> None:
@@ -861,17 +1252,19 @@ def _set_busy(busy: bool, message: str = "") -> None:
 
     state = "disabled" if busy else "normal"
     try:
-        refresh_button.config(state=state)
-        copy_button.config(state=state)
-        word_button.config(state=state)
-        variants_button.config(state=state)
+        refresh_button.configure(state=state)
+        copy_button.configure(state=state)
+        word_button.configure(state=state)
+        variants_button.configure(state=state)
     except NameError:
         # Кнопки ещё не созданы (ранний вызов при старте) — это нормально
         pass
 
+    _set_progress_visible(busy)
+
     if message:
         try:
-            gen_status_label.config(text=message)
+            gen_status_label.configure(text=message)
         except NameError:
             pass
 
@@ -918,9 +1311,11 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
                 logger.exception("Непредвиденная ошибка генерации: %s", e)
                 error = str(e)
                 try:
+                    route_cities = [c for c in cities if c != CREATIVE_MODE]
                     text = build_template_text(
-                        format_cities_list([c for c in cities if c != CREATIVE_MODE]),
+                        format_cities_list(route_cities),
                         pay_key,
+                        len(route_cities),
                     )
                 except Exception:
                     text = ""
@@ -937,6 +1332,23 @@ def generate_text_async(on_done, use_cache: bool = True) -> bool:
     return True
 
 
+def _release_busy_flag() -> None:
+    """
+    Снимает признак «идёт генерация» без обращения к виджетам.
+
+    Аварийный выход: если главный поток Tk недоступен (окно уже закрыто или
+    цикл событий не запущен), window.after() из фонового потока падает, и без
+    этого флага-предохранителя он остался бы выставленным навсегда — кнопки
+    стали бы «мёртвыми» до перезапуска программы.
+    """
+    global _generation_in_progress
+    try:
+        with _generation_lock:
+            _generation_in_progress = False
+    except Exception:
+        pass
+
+
 def _dispatch_to_ui(func) -> None:
     """
     Выполняет func в главном потоке Tk.
@@ -945,18 +1357,11 @@ def _dispatch_to_ui(func) -> None:
     window.after(0, ...). Если окно уже закрыто или главный цикл Tk
     недоступен — снимаем флаг занятости, чтобы кнопки не остались мёртвыми.
     """
-
-    def fallback():
-        try:
-            _set_busy(False, "")
-        except Exception:
-            pass
-
     try:
         window.after(0, func)
     except Exception as e:
-        logger.debug("Не удалось отправить callback в главный поток Tk: %s", e)
-        fallback()
+        logger.warning("Не удалось передать результат в главный поток Tk: %s", e)
+        _release_busy_flag()
 
 
 def refresh_preview_async() -> None:
@@ -966,10 +1371,10 @@ def refresh_preview_async() -> None:
         if error:
             logger.error("Ошибка генерации предпросмотра: %s", error)
         try:
-            text_preview.config(state="normal")
-            text_preview.delete("1.0", tk.END)
+            text_preview.configure(state="normal")
+            text_preview.delete("1.0", "end")
             text_preview.insert("1.0", text or "")
-            text_preview.config(state="disabled")
+            text_preview.configure(state="disabled")
         except Exception as e:
             logger.error("Ошибка обновления предпросмотра: %s", e)
 
@@ -1075,7 +1480,7 @@ def save_multiple_variants():
         try:
             for i in range(3):
                 window.after(
-                    0, lambda n=i: gen_status_label.config(text=f"⏳ Вариант {n+1}/3...")
+                    0, lambda n=i: gen_status_label.configure(text=f"⏳ Вариант {n+1}/3...")
                 )
                 # use_cache=False — каждый вариант должен быть уникальным
                 text = generate_text_sync(region, get_selected_cities(), use_cache=False)
@@ -1121,6 +1526,9 @@ def update_cities():
     if selected:
         global SELECTED_CITIES
         SELECTED_CITIES = selected
+        # Запоминаем выбор именно этого региона — при переходе на другой он
+        # останется на месте
+        cities_by_region[region] = list(selected)
         save_settings(selected, region, USE_AI, CREATIVITY, PAYMENT_KEY)
 
         if len(selected) == 1:
@@ -1137,37 +1545,101 @@ def update_cities():
         messagebox.showwarning("Внимание!", "Выберите хотя бы один город!")
 
 
-def switch_region(event):
-    region = get_current_region()
-    global CURRENT_REGION
-    CURRENT_REGION = region
+def apply_region_selection(region: str) -> None:
+    """
+    Показывает сохранённый выбор городов для региона.
 
-    if region == "Владивосток":
-        cities = ALL_CITIES_VLADIVOSTOK
-    elif region == "Восток":
-        cities = ALL_CITIES_EAST + [CREATIVE_MODE]
-    else:
-        cities = ALL_CITIES_SOUTH
+    Для региона, который ещё не открывали, берём города целиком — так же
+    вела себя прежняя версия при переключении вкладки. Города других регионов
+    снимаются: get_selected_cities() должен возвращать только текущий регион.
+    """
+    if not city_vars:
+        return
 
+    selected = cities_by_region.get(region)
+    if selected is None:
+        selected = list(DEFAULT_CITIES_BY_REGION.get(region, []))
+
+    chosen = set(selected)
     for city, var in city_vars.items():
-        var.set(1 if city in cities else 0)
+        var.set(1 if city in chosen else 0)
+
+
+def switch_region(event=None):
+    """
+    Смена вкладки региона.
+
+    Главное отличие от прежней версии: выбор городов больше НЕ теряется.
+    Перед переключением он сохраняется в cities_by_region[_active_region],
+    а для нового региона восстанавливается из сохранённого.
+    """
+    global CURRENT_REGION, SELECTED_CITIES, _active_region
+
+    # Во время построения окна вкладка выставляется программно — реагировать
+    # на это не нужно: виджетов ещё нет.
+    if not _gui_ready["value"]:
+        return
+
+    region = get_current_region()
+    if region == _active_region:
+        return
+
+    # 1. Сохраняем выбор покидаемого региона
+    cities_by_region[_active_region] = get_selected_cities()
+    logger.info(
+        "Регион %s: сохранён выбор городов (%d шт.)",
+        _active_region,
+        len(cities_by_region[_active_region]),
+    )
+
+    # 2. Показываем выбор нового региона
+    _active_region = region
+    CURRENT_REGION = region
+    apply_region_selection(region)
 
     selected = get_selected_cities()
-    if selected:
-        global SELECTED_CITIES
-        SELECTED_CITIES = selected
-        save_settings(selected, region, USE_AI, CREATIVITY, PAYMENT_KEY)
+    SELECTED_CITIES = selected
+    save_settings(selected, region, USE_AI, CREATIVITY, PAYMENT_KEY)
 
     refresh_preview_async()
 
 
+def _on_city_toggle(city: str) -> None:
+    """
+    Реакция на установку галочки города.
+
+    «Без города» — это режим, а не город: вместе со списком городов он
+    противоречит сам себе (раньше так и получалось — в тексте появлялось
+    «Без города» и рядом перечисление городов). Поэтому отметка одного
+    снимает другое.
+    """
+    if city == CREATIVE_MODE:
+        if city_vars[CREATIVE_MODE].get() != 1:
+            return
+        for other, var in city_vars.items():
+            if other != CREATIVE_MODE:
+                var.set(0)
+    else:
+        if city_vars[city].get() != 1:
+            return
+        creative = city_vars.get(CREATIVE_MODE)
+        if creative is not None:
+            creative.set(0)
+
+
+def _update_ai_switch_text() -> None:
+    """Подпись переключателя ИИ: сразу видно, включён он или нет."""
+    try:
+        ai_switch.configure(text=f"🤖 ИИ: {'ВКЛ' if USE_AI else 'ВЫКЛ'}")
+    except NameError:
+        pass
+
+
 def toggle_ai():
     global USE_AI
-    USE_AI = not USE_AI
-    ai_button.config(
-        text=f"{'✅' if USE_AI else '❌'} ИИ: {'ВКЛ' if USE_AI else 'ВЫКЛ'}",
-        bg="#4CAF50" if USE_AI else "#f44336",
-    )
+    USE_AI = bool(use_ai_var.get())
+    logger.info("ИИ переключён: %s", "ВКЛ" if USE_AI else "ВЫКЛ")
+    _update_ai_switch_text()
     save_settings(
         get_selected_cities(), get_current_region(), USE_AI, CREATIVITY, PAYMENT_KEY
     )
@@ -1176,14 +1648,23 @@ def toggle_ai():
 
 def clear_cache():
     AICache.clear()
+    # Заодно забываем историю шаблонных фраз: пользователь ждёт «новые тексты»,
+    # а не повтор уже показанных удачных строк.
+    _PHRASES.clear()
     messagebox.showinfo("Готово!", "✅ Кэш ИИ очищен!")
     refresh_preview_async()
 
 
 def update_creativity(val):
     global CREATIVITY
-    CREATIVITY = float(val)
-    creativity_label.config(text=f"Креативность: {int(CREATIVITY * 100)}%")
+    try:
+        CREATIVITY = float(val)
+    except (TypeError, ValueError):
+        return
+    try:
+        creativity_label.configure(text=f"Креативность: {int(CREATIVITY * 100)}%")
+    except NameError:
+        pass
     save_settings(
         get_selected_cities(), get_current_region(), USE_AI, CREATIVITY, PAYMENT_KEY
     )
@@ -1228,6 +1709,69 @@ def show_gigachat_help():
     )
 
 
+def _open_log_folder() -> None:
+    """Открывает папку с логами в проводнике — чтобы быстро найти файл лога."""
+    try:
+        log_path = str(LOG_FILE_HINT)
+        folder = os.path.dirname(log_path) or str(PROJECT_ROOT)
+        if not os.path.isdir(folder):
+            folder = str(PROJECT_ROOT)
+        if not hasattr(os, "startfile"):
+            raise RuntimeError("открытие папки поддерживается только в Windows")
+        os.startfile(folder)
+    except Exception as exc:
+        logger.warning("Не удалось открыть папку с логами: %s", exc)
+        messagebox.showinfo("Логи", f"Файл лога лежит здесь:\n\n{LOG_FILE_HINT}")
+
+
+# ============================================
+# ДИАЛОГИ (CustomTkinter)
+# ============================================
+
+
+def _center_dialog(dialog: "ctk.CTkToplevel", width: int, height: int) -> None:
+    """
+    Ставит диалог по центру главного окна.
+
+    Раньше диалоги открывались в углу экрана — на большом мониторе их можно
+    было просто не заметить.
+    """
+    try:
+        dialog.update_idletasks()
+        x = window.winfo_rootx() + max((window.winfo_width() - width) // 2, 0)
+        y = window.winfo_rooty() + max((window.winfo_height() - height) // 3, 0)
+        dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+    except Exception as exc:  # pragma: no cover — центрирование не критично
+        logger.debug("Не удалось отцентрировать диалог: %s", exc)
+
+
+def _make_dialog(title: str, width: int, height: int) -> "ctk.CTkToplevel":
+    """
+    Создаёт модальное окно в стиле программы.
+
+    CTkToplevel на Windows иногда открывается ПОД главным окном — поэтому
+    после отрисовки поднимаем его явно.
+    """
+    dialog = ctk.CTkToplevel(window)
+    dialog.title(title)
+    dialog.geometry(f"{width}x{height}")
+    dialog.configure(fg_color=BG_WINDOW)
+    dialog.transient(window)
+    _center_dialog(dialog, width, height)
+    dialog.after(60, lambda: _lift_dialog(dialog))
+    return dialog
+
+
+def _lift_dialog(dialog: "ctk.CTkToplevel") -> None:
+    """Поднимает диалог поверх главного окна (окно могло быть уже закрыто)."""
+    try:
+        if dialog.winfo_exists():
+            dialog.lift()
+            dialog.focus_force()
+    except Exception:
+        pass
+
+
 def show_ssl_help():
     """
     Инструкция «Как исправить» для SSL-ошибки.
@@ -1235,25 +1779,20 @@ def show_ssl_help():
     Текст берётся из llm_provider.get_ssl_help(), чтобы лог и интерфейс
     не расходились. Окно с прокруткой: инструкция длинная.
     """
-    dialog = tk.Toplevel(window)
-    dialog.title("⚠️ SSL: как исправить")
-    dialog.configure(bg=BG_COLOR)
-    dialog.transient(window)
+    dialog = _make_dialog("⚠️ SSL: как исправить", 900, 600)
+    dialog.minsize(720, 480)
 
-    tk.Label(
+    ctk.CTkLabel(
         dialog,
         text="⚠️ Ошибка проверки SSL-сертификата",
-        font=("Arial", 12, "bold"),
-        fg="#c62828",
-        bg=BG_COLOR,
-    ).pack(pady=(15, 5))
+        font=FONT_H2,
+        text_color=COLOR_TEXT_ERR,
+    ).pack(pady=(16, 6), padx=16)
 
-    text = tk.Text(
-        dialog, width=84, height=20, wrap="word", font=("Consolas", 9), bg="white"
-    )
-    text.pack(padx=15, pady=5, fill="both", expand=True)
+    text = ctk.CTkTextbox(dialog, wrap="word", font=FONT_MONO, fg_color="#0f1216")
+    text.pack(padx=16, pady=6, fill="both", expand=True)
     text.insert("1.0", get_ssl_help())
-    text.config(state="disabled")
+    text.configure(state="disabled")
 
     def open_download():
         """Открывает страницу с сертификатом в браузере по умолчанию."""
@@ -1266,32 +1805,26 @@ def show_ssl_help():
             messagebox.showinfo("Ссылка", f"Откройте вручную:\n\n{url}")
             logger.warning("Не удалось открыть браузер: %s", e)
 
-    buttons = tk.Frame(dialog, bg=BG_COLOR)
-    buttons.pack(pady=10)
+    buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+    buttons.pack(pady=(6, 16))
 
-    tk.Button(
+    ctk.CTkButton(
         buttons,
         text="⬇️ Открыть страницу сертификата",
-        font=("Arial", 9, "bold"),
-        bg="#2196F3",
-        fg="white",
-        padx=12,
-        pady=5,
-        cursor="hand2",
+        font=FONT_SMALL,
+        fg_color=COLOR_ACCENT,
+        hover_color=COLOR_ACCENT_HOVER,
         command=open_download,
-    ).pack(side="left", padx=5)
+    ).pack(side="left", padx=6)
 
-    tk.Button(
+    ctk.CTkButton(
         buttons,
         text="Закрыть",
-        font=("Arial", 9),
-        bg="#9E9E9E",
-        fg="white",
-        padx=12,
-        pady=5,
-        cursor="hand2",
+        font=FONT_SMALL,
+        fg_color=COLOR_TOOL,
+        hover_color=COLOR_TOOL_HOVER,
         command=dialog.destroy,
-    ).pack(side="left", padx=5)
+    ).pack(side="left", padx=6)
 
     text.see("1.0")
     dialog.bind("<Escape>", lambda event: dialog.destroy())
@@ -1508,6 +2041,18 @@ def _build_diagnostics_report() -> str:
         lines.append(f"⚠️ Логгер: не удалось определить путь ({exc})")
     lines.append("")
 
+    # ---------- Настройки ----------
+    try:
+        lines.append(f"✅ Настройки: {SETTINGS_FILE}")
+        lines.append(f"   регион: {CURRENT_REGION}, городов выбрано: {len(cities_by_region.get(CURRENT_REGION, []))}")
+        for region in REGIONS:
+            lines.append(
+                f"   {region}: {len(cities_by_region.get(region, []))} шт. в памяти"
+            )
+    except Exception as exc:
+        lines.append(f"⚠️ Настройки: не удалось прочитать ({exc})")
+    lines.append("")
+
     # ---------- Мьютекс ----------
     if _mutex_handle is None and not _already_running:
         lines.append("✅ Мьютекс: свободен (это единственная копия программы)")
@@ -1521,7 +2066,7 @@ def _build_diagnostics_report() -> str:
 
     # ---------- Окружение ----------
     lines.append(f"✅ Python: {platform.python_version()} ({sys.executable})")
-    lines.append("✅ tkinter: OK")
+    lines.append(f"✅ tkinter: OK | CustomTkinter: {ctk.__version__}")
 
     for module_name, human in (
         ("docx", "python-docx"),
@@ -1529,6 +2074,7 @@ def _build_diagnostics_report() -> str:
         ("dotenv", "python-dotenv"),
         ("gigachat", "gigachat"),
         ("requests", "requests"),
+        ("customtkinter", "customtkinter"),
     ):
         try:
             __import__(module_name)
@@ -1564,24 +2110,24 @@ def _build_diagnostics_report() -> str:
     return "\n".join(lines)
 
 
-def _diag_show_progress(dialog: "tk.Toplevel", text: "tk.Text") -> None:
+def _diag_show_progress(dialog: "ctk.CTkToplevel", text: "ctk.CTkTextbox") -> None:
     """Заглушка «идёт проверка», чтобы окно не выглядело зависшим."""
-    text.config(state="normal")
+    text.configure(state="normal")
     text.delete("1.0", "end")
     text.insert("1.0", "🔍 Идёт диагностика, подождите…")
-    text.config(state="disabled")
+    text.configure(state="disabled")
 
 
-def _show_diagnostics_result(dialog: "tk.Toplevel", report: str) -> None:
+def _show_diagnostics_result(dialog: "ctk.CTkToplevel", report: str) -> None:
     """Показывает готовый отчёт в уже открытом окне."""
     try:
         text = _diag_widgets.get("text")
         if text is None or not text.winfo_exists():
             return
-        text.config(state="normal")
+        text.configure(state="normal")
         text.delete("1.0", "end")
         text.insert("1.0", report)
-        text.config(state="disabled")
+        text.configure(state="disabled")
         text.see("1.0")
     except Exception as exc:
         logger.warning("Не удалось показать диагностику: %s", exc)
@@ -1599,34 +2145,24 @@ def show_diagnostics():
     поток через window.after(): обращаться к виджетам из другого потока
     нельзя.
     """
-    dialog = tk.Toplevel(window)
-    dialog.title("📋 Диагностика")
-    dialog.configure(bg=BG_COLOR)
-    dialog.transient(window)
+    dialog = _make_dialog("📋 Диагностика", 1000, 700)
+    dialog.minsize(820, 520)
 
-    tk.Label(
+    ctk.CTkLabel(
         dialog,
         text="📋 Диагностика программы",
-        font=("Arial", 12, "bold"),
-        bg=BG_COLOR,
-    ).pack(pady=(12, 4))
+        font=FONT_H2,
+        text_color=TEXT_MAIN,
+    ).pack(pady=(16, 6), padx=16)
 
-    frame = tk.Frame(dialog, bg=BG_COLOR)
-    frame.pack(padx=12, pady=5, fill="both", expand=True)
-
-    text = tk.Text(
-        frame, width=92, height=30, wrap="word", font=("Consolas", 9), bg="white"
-    )
-    scrollbar = tk.Scrollbar(frame, command=text.yview)
-    text.configure(yscrollcommand=scrollbar.set)
-    scrollbar.pack(side="right", fill="y")
-    text.pack(side="left", fill="both", expand=True)
+    text = ctk.CTkTextbox(dialog, wrap="word", font=FONT_MONO, fg_color="#0f1216")
+    text.pack(padx=16, pady=6, fill="both", expand=True)
 
     _diag_widgets["text"] = text
     _diag_show_progress(dialog, text)
 
-    buttons = tk.Frame(dialog, bg=BG_COLOR)
-    buttons.pack(pady=10)
+    buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+    buttons.pack(pady=(6, 16))
 
     def copy_report():
         try:
@@ -1642,53 +2178,41 @@ def show_diagnostics():
         _diag_show_progress(dialog, text)
         _run_diagnostics_async(dialog)
 
-    tk.Button(
+    ctk.CTkButton(
         buttons,
         text="🔄 Обновить",
-        font=("Arial", 9),
-        bg="#2196F3",
-        fg="white",
-        padx=12,
-        pady=4,
-        cursor="hand2",
+        font=FONT_SMALL,
+        fg_color=COLOR_ACCENT,
+        hover_color=COLOR_ACCENT_HOVER,
         command=refresh,
-    ).pack(side="left", padx=4)
+    ).pack(side="left", padx=5)
 
-    tk.Button(
+    ctk.CTkButton(
         buttons,
         text="📄 Скопировать отчёт",
-        font=("Arial", 9),
-        bg="#455A64",
-        fg="white",
-        padx=12,
-        pady=4,
-        cursor="hand2",
+        font=FONT_SMALL,
+        fg_color=COLOR_TOOL,
+        hover_color=COLOR_TOOL_HOVER,
         command=copy_report,
-    ).pack(side="left", padx=4)
+    ).pack(side="left", padx=5)
 
-    tk.Button(
+    ctk.CTkButton(
         buttons,
         text="🌐 Как исправить SSL",
-        font=("Arial", 9),
-        bg="#c62828",
-        fg="white",
-        padx=12,
-        pady=4,
-        cursor="hand2",
+        font=FONT_SMALL,
+        fg_color=COLOR_DANGER,
+        hover_color=COLOR_DANGER_HOVER,
         command=show_ssl_help,
-    ).pack(side="left", padx=4)
+    ).pack(side="left", padx=5)
 
-    tk.Button(
+    ctk.CTkButton(
         buttons,
         text="Закрыть",
-        font=("Arial", 9),
-        bg="#9E9E9E",
-        fg="white",
-        padx=12,
-        pady=4,
-        cursor="hand2",
+        font=FONT_SMALL,
+        fg_color=COLOR_TOOL,
+        hover_color=COLOR_TOOL_HOVER,
         command=dialog.destroy,
-    ).pack(side="left", padx=4)
+    ).pack(side="left", padx=5)
 
     dialog.bind("<Escape>", lambda event: dialog.destroy())
 
@@ -1696,7 +2220,7 @@ def show_diagnostics():
     text.see("1.0")
 
 
-def _run_diagnostics_async(dialog: "tk.Toplevel") -> None:
+def _run_diagnostics_async(dialog: "ctk.CTkToplevel") -> None:
     """
     Собирает отчёт в фоновом потоке и отдаёт его в главный поток.
 
@@ -1723,7 +2247,6 @@ def _run_diagnostics_async(dialog: "tk.Toplevel") -> None:
     threading.Thread(target=worker, name="diagnostics", daemon=True).start()
 
 
-
 # ============================================
 # ВВОД КЛЮЧА ПРЯМО ИЗ ИНТЕРФЕЙСА
 # ============================================
@@ -1738,46 +2261,42 @@ def enter_api_key():
     """
     global GIGACHAT_READY, GIGACHAT_MODEL
 
-    dialog = tk.Toplevel(window)
-    dialog.title("Ввод API-ключа GigaChat")
-    dialog.configure(bg=BG_COLOR)
+    dialog = _make_dialog("Ввод API-ключа GigaChat", 640, 430)
     dialog.resizable(False, False)
-    dialog.transient(window)
     dialog.grab_set()
 
-    tk.Label(
+    ctk.CTkLabel(
         dialog,
         text="🔑 API-ключ GigaChat",
-        font=("Arial", 12, "bold"),
-        bg=BG_COLOR,
-    ).pack(pady=(15, 5))
+        font=FONT_H2,
+        text_color=TEXT_MAIN,
+    ).pack(pady=(18, 8), padx=20)
 
-    tk.Label(
+    ctk.CTkLabel(
         dialog,
         text=(
             "Получите Authorization Key (base64):\n"
             "developers.sber.ru → Личный кабинет → Настройки\n\n"
             "Ключ сохранится в .env и НЕ попадёт в Git."
         ),
-        font=("Arial", 9),
-        bg=BG_COLOR,
+        font=FONT_SMALL,
+        text_color=TEXT_DIM,
         justify="center",
-    ).pack(padx=20, pady=5)
+    ).pack(padx=20, pady=(0, 8))
 
     # show="*" — ключ не отображается на экране
-    key_entry = tk.Entry(dialog, width=55, font=("Arial", 9), show="*")
-    key_entry.pack(padx=20, pady=(10, 2))
+    key_entry = ctk.CTkEntry(dialog, width=460, font=FONT_SMALL, show="*")
+    key_entry.pack(padx=20, pady=(6, 4))
     key_entry.focus_set()
 
     # Счётчик символов: благодаря ему видно, что вставка сработала. Раньше
     # при пустом поле (например, Ctrl+V не сработал) кнопка «Сохранить»
     # отвечала «Ключ не введён» — и было непонятно, почему.
-    key_hint = tk.Label(
+    key_hint = ctk.CTkLabel(
         dialog,
         text="Длина ключа: 0 символов",
-        font=("Arial", 8),
-        fg="#888",
-        bg=BG_COLOR,
+        font=FONT_SMALL,
+        text_color=TEXT_DIM,
     )
     key_hint.pack()
 
@@ -1787,10 +2306,10 @@ def enter_api_key():
             length = len(key_entry.get())
         except Exception:
             return
-        key_hint.config(
+        key_hint.configure(
             text=f"Длина ключа: {length} символов"
             + ("" if length else "  ← поле пустое"),
-            fg="#888" if length else "#c62828",
+            text_color=TEXT_DIM if length else COLOR_TEXT_ERR,
         )
 
     def _paste_key(event=None) -> str:
@@ -1816,13 +2335,12 @@ def enter_api_key():
     key_entry.bind("<Control-V>", _paste_key)
     key_entry.bind("<<Paste>>", _paste_key)
 
-    tk.Label(
+    ctk.CTkLabel(
         dialog,
         text="(символы скрыты — это нормально, вставка через Ctrl+V)",
-        font=("Arial", 8),
-        fg="#888",
-        bg=BG_COLOR,
-    ).pack()
+        font=FONT_SMALL,
+        text_color=TEXT_DIM,
+    ).pack(pady=(2, 10))
 
     def save():
         global GIGACHAT_READY, GIGACHAT_MODEL
@@ -1833,8 +2351,9 @@ def enter_api_key():
         key = sanitize_key(key_entry.get())
 
         if not key:
-            key_hint.config(
-                text="Длина ключа: 0 символов  ← поле пустое", fg="#c62828"
+            key_hint.configure(
+                text="Длина ключа: 0 символов  ← поле пустое",
+                text_color=COLOR_TEXT_ERR,
             )
             messagebox.showwarning(
                 "Внимание",
@@ -1863,11 +2382,11 @@ def enter_api_key():
 
         dialog.destroy()
 
-        # Обновляем индикатор в шапке
+        # Обновляем индикатор в статус-баре
         try:
-            status_label.config(
+            status_label.configure(
                 text=f"GigaChat: ✅ GigaChat готов ({GIGACHAT_MODEL})",
-                fg="#4CAF50",
+                text_color=COLOR_TEXT_OK,
             )
         except NameError:
             pass
@@ -1893,40 +2412,31 @@ def enter_api_key():
         else:
             refresh_preview_async()
 
-    cancel_button = tk.Button(
-        dialog,
-        text="Отмена",
-        font=("Arial", 9),
-        bg="#9E9E9E",
-        fg="white",
-        padx=15,
-        pady=5,
-        cursor="hand2",
-        command=dialog.destroy,
-    )
-    cancel_button.pack(side="left", padx=20, pady=15)
+    buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+    buttons.pack(pady=(6, 18), padx=20, fill="x")
 
-    save_button = tk.Button(
-        dialog,
+    ctk.CTkButton(
+        buttons,
+        text="Отмена",
+        font=FONT_SMALL,
+        width=140,
+        fg_color=COLOR_TOOL,
+        hover_color=COLOR_TOOL_HOVER,
+        command=dialog.destroy,
+    ).pack(side="left")
+
+    ctk.CTkButton(
+        buttons,
         text="💾 Сохранить",
-        font=("Arial", 9, "bold"),
-        bg="#4CAF50",
-        fg="white",
-        padx=15,
-        pady=5,
-        cursor="hand2",
+        font=FONT_SMALL_BOLD,
+        width=160,
+        fg_color=COLOR_PRIMARY,
+        hover_color=COLOR_PRIMARY_HOVER,
         command=save,
-    )
-    save_button.pack(side="right", padx=20, pady=15)
+    ).pack(side="right")
 
     dialog.bind("<Return>", lambda event: save())
     dialog.bind("<Escape>", lambda event: dialog.destroy())
-
-    # Центрируем диалог относительно главного окна
-    dialog.update_idletasks()
-    x = window.winfo_rootx() + (window.winfo_width() - dialog.winfo_width()) // 2
-    y = window.winfo_rooty() + (window.winfo_height() - dialog.winfo_height()) // 3
-    dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
 
 # ============================================
@@ -1944,6 +2454,10 @@ _window_closed = {"value": False}
 # Заполняются при старте главного цикла (см. _run_gui)
 _mutex_handle = None
 _already_running = False
+
+# False до конца построения окна: обработчик смены вкладки не должен
+# срабатывать на программную установку вкладки при старте.
+_gui_ready = {"value": False}
 
 
 def on_closing() -> None:
@@ -2011,54 +2525,169 @@ def _acquire_single_instance_lock():
 
 
 # ============================================
-# ГРАФИЧЕСКИЙ ИНТЕРФЕЙС
+# ГРАФИЧЕСКИЙ ИНТЕРФЕЙС (CustomTkinter)
 # ============================================
+#
+# Раскладка:
+#   ┌──────────────────────────────────────────────────────────┐
+#   │ шапка: заголовок + панель инструментов                   │
+#   │ плашка «ключ не задан» / плашка SSL (по необходимости)   │
+#   ├───────────────────┬──────────────────────────────────────┤
+#   │ настройки (380px) │ предпросмотр (растягивается)         │
+#   │ вкладки регионов  │ «показать новый вариант» + прогресс  │
+#   │ города, оплата,   │ текст КП                             │
+#   │ креативность      │ копировать / Word / 3 варианта       │
+#   ├───────────────────┴──────────────────────────────────────┤
+#   │ статус-бар: GigaChat + путь к логу                       │
+#   └──────────────────────────────────────────────────────────┘
 
-window = tk.Tk()
-window.title("Генератор КП - Автоперевозки (GigaChat)")
-window.geometry("880x980")
-window.resizable(False, False)
-BG_COLOR = "#f0f4f8"
-window.configure(bg=BG_COLOR)
+logger.info("Создание графического интерфейса (CustomTkinter)")
 
-header_frame = tk.Frame(window, bg=BG_COLOR)
-header_frame.pack(fill="x", pady=10)
 
-tk.Label(
-    header_frame,
+def _fit_window_to_screen(
+    win: "ctk.CTk",
+    want_width: int,
+    want_height: int,
+    min_width: int,
+    min_height: int,
+) -> None:
+    """
+    Подгоняет размер окна под экран и ставит его по центру.
+
+    Зачем: на ноутбуке 1366x768 окно 1180x820 выше экрана — нижний край
+    (кнопки и статус-бар) уходил под панель задач, и дотянуться до него было
+    нельзя. Плюс Windows открывает новое окно со сдвигом вниз, из-за чего та же
+    проблема возникала и на 1920x1080.
+
+    Высота берётся с запасом 88 % от экрана: остальное занимает панель задач.
+    """
+    try:
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        limit_w = int(screen_w * 0.95)
+        limit_h = int(screen_h * 0.88)
+
+        width = min(want_width, limit_w) if limit_w >= min_width else limit_w
+        height = min(want_height, limit_h) if limit_h >= min_height else limit_h
+        width = max(width, 900)
+        height = max(height, 560)
+
+        x = max((screen_w - width) // 2, 0)
+        # Делим на три, а не на два: окно встаёт чуть выше центра и не
+        # упирается в панель задач снизу.
+        y = max((screen_h - height) // 3, 0)
+
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.minsize(min(min_width, width), min(min_height, height))
+        logger.info("Окно: %dx%d (экран %dx%d)", width, height, screen_w, screen_h)
+    except Exception as exc:  # pragma: no cover — размер окна не критичен
+        logger.debug("Не удалось подогнать окно под экран: %s", exc)
+        win.geometry(f"{want_width}x{want_height}")
+
+
+window = ctk.CTk()
+window.title("Генератор КП — Автоперевозки (GigaChat)")
+window.configure(fg_color=BG_WINDOW)
+_fit_window_to_screen(window, 1180, 820, 1000, 660)
+
+# Шрифты. Segoe UI — системный шрифт Windows: есть кириллица и подстановка
+# эмодзи, чего не хватает встроенному в CustomTkinter Roboto.
+FONT_H1 = ctk.CTkFont(family="Segoe UI", size=22, weight="bold")
+FONT_H2 = ctk.CTkFont(family="Segoe UI", size=15, weight="bold")
+FONT_UI = ctk.CTkFont(family="Segoe UI", size=14)
+FONT_SMALL_BOLD = ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
+FONT_SMALL = ctk.CTkFont(family="Segoe UI", size=12)
+FONT_TINY = ctk.CTkFont(family="Segoe UI", size=11)
+FONT_MONO = ctk.CTkFont(family="Consolas", size=12)
+
+window.grid_columnconfigure(0, weight=1)
+window.grid_rowconfigure(3, weight=1)  # растягивается только тело окна
+
+# ---------- Шапка ----------
+# Заголовок и панель инструментов стоят в ДВЕ строки: в одну они не помещаются,
+# и заголовок обрезался по краям (проверено — не хватало ~150 px).
+header_frame = ctk.CTkFrame(window, corner_radius=0, fg_color=BG_HEADER)
+header_frame.grid(row=0, column=0, sticky="ew")
+header_frame.grid_columnconfigure(0, weight=1)
+
+title_box = ctk.CTkFrame(header_frame, fg_color="transparent")
+title_box.grid(row=0, column=0, sticky="w", padx=18, pady=(12, 0))
+
+ctk.CTkLabel(
+    title_box,
     text="🚛 ГЕНЕРАТОР КОММЕРЧЕСКИХ ПРЕДЛОЖЕНИЙ",
-    font=("Arial", 16, "bold"),
-    bg=BG_COLOR,
-).pack()
+    font=FONT_H1,
+    text_color=TEXT_MAIN,
+).pack(anchor="w")
 
-# Индикатор статуса GigaChat
-if GIGACHAT_READY:
-    status_text = f"✅ GigaChat готов ({GIGACHAT_MODEL})"
-    status_color = "#4CAF50"
-else:
-    status_text = "❌ Ключ не задан — используется шаблонный текст"
-    status_color = "#f44336"
+ctk.CTkLabel(
+    title_box,
+    text="Лоты машин для автовозов · текст собирается из данных лота и настроек",
+    font=FONT_TINY,
+    text_color=TEXT_DIM,
+).pack(anchor="w")
 
-status_label = tk.Label(
-    header_frame,
-    text=f"GigaChat: {status_text}",
-    font=("Arial", 9),
-    fg=status_color,
-    bg=BG_COLOR,
+# Панель инструментов: ИИ вкл/выкл, прогрев, ключ, кэш, диагностика, помощь, выход
+toolbar = ctk.CTkFrame(header_frame, fg_color="transparent")
+toolbar.grid(row=1, column=0, sticky="e", padx=16, pady=(4, 10))
+
+use_ai_var = tk.IntVar(value=1 if USE_AI else 0)
+ai_switch = ctk.CTkSwitch(
+    toolbar,
+    text=f"🤖 ИИ: {'ВКЛ' if USE_AI else 'ВЫКЛ'}",
+    font=FONT_SMALL_BOLD,
+    variable=use_ai_var,
+    onvalue=1,
+    offvalue=0,
+    progress_color=COLOR_AI_ON,
+    button_color="#e9ecf1",
+    button_hover_color="#cfd6e0",
+    command=toggle_ai,
 )
-status_label.pack()
+ai_switch.pack(side="left", padx=(0, 10))
 
-# Если ключа нет — сразу говорим, что делать (а не просто красная строка).
+ctk.CTkLabel(
+    toolbar,
+    text=f"Модель: {GIGACHAT_MODEL}",
+    font=FONT_TINY,
+    text_color=TEXT_DIM,
+).pack(side="left", padx=(0, 10))
+
+
+def _tool_button(text: str, command, color: str = COLOR_TOOL, hover: str = COLOR_TOOL_HOVER, width: int = 0):
+    """Кнопка панели инструментов одного размера — шапка не «плывёт»."""
+    button = ctk.CTkButton(
+        toolbar,
+        text=text,
+        font=FONT_SMALL,
+        width=width,
+        height=32,
+        fg_color=color,
+        hover_color=hover,
+        command=command,
+    )
+    button.pack(side="left", padx=3)
+    return button
+
+
+_tool_button("⚡ Прогрев", warmup_async, COLOR_ACCENT, COLOR_ACCENT_HOVER)
+_tool_button("🔑 Ключ", enter_api_key, COLOR_ACCENT, COLOR_ACCENT_HOVER)
+_tool_button("🗑️ Кэш", clear_cache, COLOR_WARN, COLOR_WARN_HOVER)
+_tool_button("📋 Диагностика", show_diagnostics)
+_tool_button("❓ Помощь", show_gigachat_help)
+_tool_button("✖ Выход", on_exit_button, COLOR_DANGER, COLOR_DANGER_HOVER)
+
+# ---------- Плашки предупреждений ----------
 # Плашка создаётся всегда, а видимостью управляет update_key_banner():
 # после ввода ключа кнопкой «🔑 Ключ» она должна исчезать без перезапуска.
-key_warning_label = tk.Label(
-    header_frame,
-    text="⚠️ Ключ GigaChat не задан. Нажмите 🔑 для ввода",
-    font=("Arial", 9, "bold"),
-    fg="#b71c1c",
-    bg="#ffe0e0",
-    padx=8,
-    pady=3,
+key_warning_label = ctk.CTkLabel(
+    window,
+    text="⚠️ Ключ GigaChat не задан. Нажмите 🔑 «Ключ» в шапке, чтобы вставить ключ",
+    font=FONT_SMALL_BOLD,
+    text_color="#7f1d1d",
+    fg_color="#ffe0e0",
+    corner_radius=8,
+    height=30,
 )
 
 
@@ -2072,13 +2701,11 @@ def update_key_banner() -> None:
     """
     if GIGACHAT_READY:
         if key_warning_label.winfo_manager():
-            key_warning_label.pack_forget()
+            key_warning_label.grid_forget()
     else:
         if not key_warning_label.winfo_manager():
-            key_warning_label.pack(pady=3)
+            key_warning_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
 
-
-update_key_banner()
 
 # Плашка про SSL. Показывается в двух случаях:
 #   1. СРАЗУ при старте — сертификата Минцифры нет, а ключ задан. Тогда
@@ -2086,27 +2713,28 @@ update_key_banner()
 #      первого нажатия «Сгенерировать» (раньше — только по факту ошибки).
 #   2. После падения запроса по сертификату (has_ssl_error()).
 # Плашка немодальная: она ничего не блокирует и не мешает работать.
-ssl_banner = tk.Frame(window, bg="#ffcdd2")
-ssl_label = tk.Label(
+ssl_banner = ctk.CTkFrame(window, fg_color="#ffcdd2", corner_radius=8)
+ssl_banner.grid_columnconfigure(0, weight=1)
+
+ssl_label = ctk.CTkLabel(
     ssl_banner,
     text="⚠️ SSL: не удалось проверить сертификат GigaChat",
-    font=("Arial", 9, "bold"),
-    fg="#b71c1c",
-    bg="#ffcdd2",
+    font=FONT_SMALL_BOLD,
+    text_color="#7f1d1d",
     justify="left",
 )
-ssl_label.pack(side="left", padx=8, pady=3)
-tk.Button(
+ssl_label.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=6)
+
+ctk.CTkButton(
     ssl_banner,
     text="Как исправить",
-    font=("Arial", 8, "bold"),
-    bg="#c62828",
-    fg="white",
-    padx=8,
-    pady=1,
-    cursor="hand2",
+    font=FONT_TINY,
+    width=120,
+    height=26,
+    fg_color=COLOR_DANGER,
+    hover_color=COLOR_DANGER_HOVER,
     command=show_ssl_help,
-).pack(side="left", padx=4, pady=3)
+).grid(row=0, column=1, sticky="e", padx=(4, 10), pady=6)
 
 
 def _certificate_present() -> bool:
@@ -2121,6 +2749,395 @@ def _certificate_present() -> bool:
         logger.debug("Не удалось проверить наличие сертификата: %s", exc)
         return False
     return bool(status.get("found")) or bool(status.get("explicit_valid"))
+
+
+def update_ssl_banner(cert_ok: Optional[bool] = None) -> None:
+    """
+    Обновляет состояние плашки SSL.
+
+    Показывает предупреждение, если сертификат Минцифры отсутствует (при
+    заданном ключе) ИЛИ если запрос уже упал по SSL. Скрывает, когда всё
+    в порядке.
+
+    Args:
+        cert_ok: результат проверки сертификата. None — проверить здесь
+                 (при старте проверка уже сделана и передаётся готовой,
+                 чтобы не писать одно предупреждение в лог дважды).
+
+    Проверяем winfo_manager(), а НЕ winfo_ismapped(): у окна, которое ещё
+    не отрисовано (или свёрнуто), ismapped() возвращает 0 даже когда плашка
+    размещена — из-за этого она не убиралась после успешного запроса.
+    Плашку мы только ставим в grid, поэтому менеджер 'grid' == «показана».
+
+    Вызывается из главного потока: менять виджеты из фонового потока
+    в Tkinter нельзя.
+    """
+    try:
+        if cert_ok is None:
+            cert_ok = _certificate_present() if GIGACHAT_READY else True
+
+        need_banner = has_ssl_error() or (GIGACHAT_READY and not cert_ok)
+
+        if need_banner:
+            if has_ssl_error():
+                ssl_label.configure(
+                    text=(
+                        "⚠️ SSL: не удалось проверить сертификат GigaChat.\n"
+                        "GigaChat не отвечает — текст КП берётся из шаблонов."
+                    )
+                )
+            else:
+                ssl_label.configure(
+                    text=(
+                        "⚠️ SSL-сертификат Минцифры не найден. "
+                        "GigaChat может не отвечать. [Как исправить]"
+                    )
+                )
+
+        shown = bool(ssl_banner.winfo_manager())
+        if need_banner:
+            if not shown:
+                ssl_banner.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 0))
+        else:
+            if shown:
+                ssl_banner.grid_forget()
+    except Exception as exc:
+        logger.debug("Не удалось обновить SSL-плашку: %s", exc)
+
+
+# ---------- Тело окна: две колонки ----------
+body = ctk.CTkFrame(window, fg_color="transparent")
+body.grid(row=3, column=0, sticky="nsew", padx=12, pady=(10, 6))
+body.grid_rowconfigure(0, weight=1)
+# Левая колонка фиксированной ширины, правая растягивается.
+# ВАЖНО: ширину держит именно minsize колонки — grid_propagate(False) у
+# CustomTkinter-фрейма перестаёт работать, как только внутри появляются виджеты
+# (проверено: фрейм «съёживался» до 364 px по размеру вкладок).
+body.grid_columnconfigure(0, weight=0, minsize=LEFT_COLUMN_WIDTH)
+body.grid_columnconfigure(1, weight=1)
+
+# ---------- Левая колонка: настройки ----------
+left_column = ctk.CTkFrame(body, corner_radius=12, fg_color=BG_CARD)
+left_column.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+ctk.CTkLabel(
+    left_column,
+    text="⚙️ НАСТРОЙКИ ЛОТА",
+    font=FONT_H2,
+    text_color=TEXT_MAIN,
+).pack(anchor="w", padx=16, pady=(14, 4))
+
+notebook = ctk.CTkTabview(
+    left_column,
+    command=switch_region,
+    width=LEFT_COLUMN_WIDTH - 40,
+    # Высота заведомо небольшая: список городов всё равно прокручивается, а
+    # окно на маленьком экране должно помещаться целиком (растёт по pack).
+    height=150,
+    fg_color=BG_WINDOW,
+    segmented_button_selected_color=COLOR_PRIMARY,
+    segmented_button_selected_hover_color=COLOR_PRIMARY_HOVER,
+)
+notebook.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+
+tab_south = notebook.add(TAB_TITLES["Юга"])
+tab_vladivostok = notebook.add(TAB_TITLES["Владивосток"])
+tab_east = notebook.add(TAB_TITLES["Восток"])
+
+city_vars: Dict[str, tk.IntVar] = {}
+_city_checks: Dict[str, "ctk.CTkCheckBox"] = {}
+
+
+def _make_city_checkbox(parent, city: str, italic: bool = False) -> None:
+    """Один флажок города. Значения выставляет apply_region_selection()."""
+    var = tk.IntVar(value=0)
+    city_vars[city] = var
+    checkbox = ctk.CTkCheckBox(
+        parent,
+        text=city,
+        variable=var,
+        onvalue=1,
+        offvalue=0,
+        font=FONT_SMALL,
+        text_color="#ff8a65" if italic else TEXT_MAIN,
+        fg_color=COLOR_PRIMARY,
+        hover_color=COLOR_PRIMARY_HOVER,
+        command=lambda name=city: _on_city_toggle(name),
+    )
+    checkbox.pack(anchor="w", padx=6, pady=3)
+    _city_checks[city] = checkbox
+
+
+# ===== ЮГА =====
+south_list = ctk.CTkScrollableFrame(tab_south, fg_color="transparent")
+south_list.pack(fill="both", expand=True)
+ctk.CTkLabel(
+    south_list,
+    text="📍 Выберите города:",
+    font=FONT_SMALL_BOLD,
+    text_color=TEXT_MAIN,
+).pack(anchor="w", padx=6, pady=(2, 4))
+for _city in ALL_CITIES_SOUTH:
+    _make_city_checkbox(south_list, _city)
+
+# ===== ВЛАДИВОСТОК =====
+vladivostok_list = ctk.CTkScrollableFrame(tab_vladivostok, fg_color="transparent")
+vladivostok_list.pack(fill="both", expand=True)
+ctk.CTkLabel(
+    vladivostok_list,
+    text="📍 Выберите направления:",
+    font=FONT_SMALL_BOLD,
+    text_color=TEXT_MAIN,
+).pack(anchor="w", padx=6, pady=(2, 4))
+for _city in ALL_CITIES_VLADIVOSTOK:
+    _make_city_checkbox(vladivostok_list, _city)
+
+# ===== ВОСТОК =====
+east_list = ctk.CTkScrollableFrame(tab_east, fg_color="transparent")
+east_list.pack(fill="both", expand=True)
+ctk.CTkLabel(
+    east_list,
+    text="📍 Выберите города:",
+    font=FONT_SMALL_BOLD,
+    text_color=TEXT_MAIN,
+).pack(anchor="w", padx=6, pady=(2, 4))
+
+_make_city_checkbox(east_list, CREATIVE_MODE, italic=True)
+
+ctk.CTkLabel(
+    east_list,
+    text="«Без города» — креативный режим: города в текст не подставляются.",
+    font=FONT_TINY,
+    text_color=TEXT_DIM,
+    wraplength=LEFT_COLUMN_WIDTH - 90,
+    justify="left",
+).pack(anchor="w", padx=6, pady=(0, 6))
+
+for _city in ALL_CITIES_EAST:
+    _make_city_checkbox(east_list, _city)
+
+# ===== ТИП ОПЛАТЫ =====
+# Отдельный выбор, потому что из макета лота оплата нигде не спрашивалась:
+# программа всегда писала «безнал». Формулировка попадает и в промпт ИИ,
+# и в шаблонный текст, и в сохранённые настройки.
+payment_frame = ctk.CTkFrame(left_column, fg_color="transparent")
+payment_frame.pack(fill="x", padx=14, pady=(2, 6))
+
+ctk.CTkLabel(
+    payment_frame,
+    text="💰 Оплата:",
+    font=FONT_SMALL_BOLD,
+    text_color=TEXT_MAIN,
+).pack(side="left", padx=(0, 8))
+
+payment_var = tk.StringVar(value=PAYMENT_TYPES[PAYMENT_KEY][0])
+payment_combo = ctk.CTkOptionMenu(
+    payment_frame,
+    values=PAYMENT_LABELS,
+    variable=payment_var,
+    command=update_payment,
+    width=170,
+    height=30,
+    font=FONT_SMALL,
+    fg_color=COLOR_TOOL,
+    button_color=COLOR_TOOL_HOVER,
+    button_hover_color=COLOR_TOOL,
+    dropdown_font=FONT_SMALL,
+)
+payment_combo.pack(side="left")
+
+# ===== КРЕАТИВНОСТЬ =====
+creativity_frame = ctk.CTkFrame(left_column, fg_color="transparent")
+creativity_frame.pack(fill="x", padx=14, pady=(0, 4))
+
+creativity_label = ctk.CTkLabel(
+    creativity_frame,
+    text=f"Креативность: {int(CREATIVITY * 100)}%",
+    font=FONT_SMALL_BOLD,
+    text_color=TEXT_MAIN,
+)
+creativity_label.pack(anchor="w")
+
+creativity_slider = ctk.CTkSlider(
+    creativity_frame,
+    from_=0.2,
+    to=1.0,
+    number_of_steps=16,
+    command=update_creativity,
+    progress_color=COLOR_PRIMARY,
+    button_color=COLOR_PRIMARY,
+    button_hover_color=COLOR_PRIMARY_HOVER,
+)
+creativity_slider.set(CREATIVITY)
+creativity_slider.pack(fill="x", pady=(4, 2))
+
+ctk.CTkLabel(
+    creativity_frame,
+    text="0.2 — шаблонно, 1.0 — креативно",
+    font=FONT_TINY,
+    text_color=TEXT_DIM,
+).pack(anchor="w")
+
+ctk.CTkButton(
+    left_column,
+    text="✅ ПРИМЕНИТЬ ВЫБОР ГОРОДОВ",
+    font=FONT_SMALL_BOLD,
+    height=40,
+    fg_color=COLOR_PRIMARY,
+    hover_color=COLOR_PRIMARY_HOVER,
+    command=update_cities,
+).pack(fill="x", padx=14, pady=(8, 14))
+
+# ---------- Правая колонка: предпросмотр ----------
+right_column = ctk.CTkFrame(body, corner_radius=12, fg_color=BG_CARD)
+right_column.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+right_column.grid_rowconfigure(2, weight=1)
+right_column.grid_columnconfigure(0, weight=1)
+
+preview_top = ctk.CTkFrame(right_column, fg_color="transparent")
+preview_top.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+
+refresh_button = ctk.CTkButton(
+    preview_top,
+    text="🔄 ПОКАЗАТЬ НОВЫЙ ВАРИАНТ",
+    font=FONT_SMALL_BOLD,
+    height=42,
+    width=260,
+    fg_color=COLOR_VIOLET,
+    hover_color=COLOR_VIOLET_HOVER,
+    command=refresh_preview_async,
+)
+refresh_button.pack(side="left")
+
+gen_status_label = ctk.CTkLabel(
+    preview_top,
+    text="",
+    font=FONT_SMALL_BOLD,
+    text_color=COLOR_TEXT_WARN,
+)
+gen_status_label.pack(side="left", padx=12)
+
+# Прогресс-бар «ползёт», пока идёт фоновая генерация. Изначально скрыт:
+# постоянная анимация в окне только отвлекает.
+progress_bar = ctk.CTkProgressBar(right_column, mode="indeterminate", height=6)
+progress_bar.set(0)
+
+# Текстовое поле с предпросмотром — растягивается вместе с окном.
+# Высота минимальная: на маленьком экране окно должно помещаться целиком,
+# на большом поле растягивается само (grid, row weight).
+text_preview = ctk.CTkTextbox(
+    right_column,
+    wrap="word",
+    font=FONT_UI,
+    height=140,
+    fg_color="#0f1216",
+    text_color=TEXT_MAIN,
+    corner_radius=10,
+)
+text_preview.grid(row=2, column=0, sticky="nsew", padx=16, pady=(8, 4))
+text_preview.configure(state="disabled")
+
+ctk.CTkLabel(
+    right_column,
+    text="💡 Для Востока: отметьте «Без города» — маршрут будет описан направлением, без перечисления городов",
+    font=FONT_TINY,
+    text_color=TEXT_DIM,
+).grid(row=3, column=0, sticky="w", padx=16, pady=(0, 4))
+
+button_frame = ctk.CTkFrame(right_column, fg_color="transparent")
+button_frame.grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 16))
+button_frame.grid_columnconfigure(0, weight=1)
+button_frame.grid_columnconfigure(1, weight=1)
+button_frame.grid_columnconfigure(2, weight=1)
+
+copy_button = ctk.CTkButton(
+    button_frame,
+    text="📋 КОПИРОВАТЬ",
+    font=FONT_SMALL_BOLD,
+    height=46,
+    fg_color=COLOR_PRIMARY,
+    hover_color=COLOR_PRIMARY_HOVER,
+    command=copy_to_clipboard,
+)
+copy_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+word_button = ctk.CTkButton(
+    button_frame,
+    text="📄 СОХРАНИТЬ WORD",
+    font=FONT_SMALL_BOLD,
+    height=46,
+    fg_color=COLOR_ACCENT,
+    hover_color=COLOR_ACCENT_HOVER,
+    command=save_to_word,
+)
+word_button.grid(row=0, column=1, sticky="ew", padx=6)
+
+variants_button = ctk.CTkButton(
+    button_frame,
+    text="📚 3 ВАРИАНТА",
+    font=FONT_SMALL_BOLD,
+    height=46,
+    fg_color=COLOR_WARN,
+    hover_color=COLOR_WARN_HOVER,
+    command=save_multiple_variants,
+)
+variants_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+# ---------- Статус-бар ----------
+status_bar = ctk.CTkFrame(window, corner_radius=0, fg_color=BG_STATUS)
+status_bar.grid(row=4, column=0, sticky="ew")
+status_bar.grid_columnconfigure(0, weight=1)
+
+# Индикатор статуса GigaChat
+if GIGACHAT_READY:
+    status_text = f"✅ GigaChat готов ({GIGACHAT_MODEL})"
+    status_color = COLOR_TEXT_OK
+else:
+    status_text = "❌ Ключ не задан — используется шаблонный текст"
+    status_color = COLOR_TEXT_ERR
+
+status_label = ctk.CTkLabel(
+    status_bar,
+    text=f"GigaChat: {status_text}",
+    font=FONT_SMALL,
+    text_color=status_color,
+)
+status_label.grid(row=0, column=0, sticky="w", padx=14, pady=6)
+
+log_box = ctk.CTkFrame(status_bar, fg_color="transparent")
+log_box.grid(row=0, column=1, sticky="e", padx=14, pady=6)
+
+ctk.CTkLabel(
+    log_box,
+    text=f"📄 Лог: {LOG_FILE_HINT}",
+    font=FONT_TINY,
+    text_color=TEXT_DIM,
+).pack(side="left", padx=(0, 8))
+
+ctk.CTkButton(
+    log_box,
+    text="Открыть папку",
+    font=FONT_TINY,
+    width=110,
+    height=24,
+    fg_color=COLOR_TOOL,
+    hover_color=COLOR_TOOL_HOVER,
+    command=_open_log_folder,
+).pack(side="left")
+
+# Показать сохранённый регион и его выбор городов
+notebook.set(TAB_TITLES[CURRENT_REGION])
+apply_region_selection(CURRENT_REGION)
+_active_region = CURRENT_REGION
+_gui_ready["value"] = True
+
+logger.info("Интерфейс загружен")
+
+# Плашку SSL выставляем сразу после построения окна: если сертификата нет,
+# пользователь видит предупреждение ещё до первого запроса к GigaChat.
+# Повторная (уже без записи в лог) проверка — в _run_gui перед mainloop().
+update_key_banner()
+update_ssl_banner()
 
 
 def _startup_ssl_check() -> None:
@@ -2167,389 +3184,6 @@ def _startup_ssl_check() -> None:
         update_ssl_banner(cert_ok)
     except Exception as exc:  # pragma: no cover
         logger.debug("Стартовая проверка сертификата не удалась: %s", exc)
-
-
-def update_ssl_banner(cert_ok: Optional[bool] = None) -> None:
-    """
-    Обновляет состояние плашки SSL.
-
-    Показывает предупреждение, если сертификат Минцифры отсутствует (при
-    заданном ключе) ИЛИ если запрос уже упал по SSL. Скрывает, когда всё
-    в порядке.
-
-    Args:
-        cert_ok: результат проверки сертификата. None — проверить здесь
-                 (при старте проверка уже сделана и передаётся готовой,
-                 чтобы не писать одно предупреждение в лог дважды).
-
-    Проверяем winfo_manager(), а НЕ winfo_ismapped(): у окна, которое ещё
-    не отрисовано (или свёрнуто), ismapped() возвращает 0 даже когда плашка
-    упакована — из-за этого она не убиралась после успешного запроса.
-    Плашку мы только пакуем (pack), поэтому менеджер 'pack' == «показана».
-
-    Вызывается из главного потока: менять виджеты из фонового потока
-    в Tkinter нельзя.
-    """
-    try:
-        if cert_ok is None:
-            cert_ok = _certificate_present() if GIGACHAT_READY else True
-
-        need_banner = has_ssl_error() or (GIGACHAT_READY and not cert_ok)
-
-        if need_banner:
-            if has_ssl_error():
-                ssl_label.config(
-                    text=(
-                        "⚠️ SSL: не удалось проверить сертификат GigaChat.\n"
-                        "GigaChat не отвечает — текст КП берётся из шаблонов."
-                    )
-                )
-            else:
-                ssl_label.config(
-                    text=(
-                        "⚠️ SSL-сертификат Минцифры не найден. "
-                        "GigaChat может не отвечать. [Как исправить]"
-                    )
-                )
-
-        shown = bool(ssl_banner.winfo_manager())
-        if need_banner:
-            if not shown:
-                ssl_banner.pack(fill="x", padx=20, pady=4)
-        else:
-            if shown:
-                ssl_banner.pack_forget()
-    except Exception as exc:
-        logger.debug("Не удалось обновить SSL-плашку: %s", exc)
-
-
-ai_control_frame = tk.Frame(window, bg=BG_COLOR)
-ai_control_frame.pack(pady=5)
-
-ai_button = tk.Button(
-    ai_control_frame,
-    text=f"{'✅' if USE_AI else '❌'} ИИ: {'ВКЛ' if USE_AI else 'ВЫКЛ'}",
-    font=("Arial", 9, "bold"),
-    bg="#4CAF50" if USE_AI else "#f44336",
-    fg="white",
-    padx=10,
-    pady=3,
-    cursor="hand2",
-    command=toggle_ai,
-)
-ai_button.pack(side="left", padx=5)
-
-tk.Label(
-    ai_control_frame, text=f"Модель: {GIGACHAT_MODEL}", font=("Arial", 9), bg=BG_COLOR
-).pack(side="left", padx=5)
-
-tk.Button(
-    ai_control_frame,
-    text="⚡ Прогрев",
-    font=("Arial", 9),
-    bg="#2196F3",
-    fg="white",
-    padx=8,
-    pady=3,
-    cursor="hand2",
-    command=warmup_async,
-).pack(side="left", padx=2)
-
-tk.Button(
-    ai_control_frame,
-    text="🔑 Ключ",
-    font=("Arial", 9),
-    bg="#3F51B5",
-    fg="white",
-    padx=8,
-    pady=3,
-    cursor="hand2",
-    command=enter_api_key,
-).pack(side="left", padx=2)
-
-tk.Button(
-    ai_control_frame,
-    text="🗑️ Кэш",
-    font=("Arial", 9),
-    bg="#FF9800",
-    fg="white",
-    padx=8,
-    pady=3,
-    cursor="hand2",
-    command=clear_cache,
-).pack(side="left", padx=5)
-
-tk.Button(
-    ai_control_frame,
-    text="📋 Диагностика",
-    font=("Arial", 9),
-    bg="#455A64",
-    fg="white",
-    padx=8,
-    pady=3,
-    cursor="hand2",
-    command=show_diagnostics,
-).pack(side="left", padx=2)
-
-tk.Button(
-    ai_control_frame,
-    text="❓",
-    font=("Arial", 9),
-    bg="#607D8B",
-    fg="white",
-    padx=8,
-    pady=3,
-    cursor="hand2",
-    command=show_gigachat_help,
-).pack(side="left", padx=2)
-
-creativity_frame = tk.Frame(window, bg=BG_COLOR)
-creativity_frame.pack(pady=5)
-
-creativity_label = tk.Label(
-    creativity_frame,
-    text=f"Креативность: {int(CREATIVITY * 100)}%",
-    font=("Arial", 9),
-    bg=BG_COLOR,
-)
-creativity_label.pack(side="left", padx=10)
-
-creativity_slider = tk.Scale(
-    creativity_frame,
-    from_=0.2,
-    to=1.0,
-    resolution=0.05,
-    orient="horizontal",
-    length=300,
-    bg=BG_COLOR,
-    command=update_creativity,
-)
-creativity_slider.set(CREATIVITY)
-creativity_slider.pack(side="left", padx=10)
-
-tk.Label(
-    creativity_frame,
-    text="(0.2 - шаблонно, 1.0 - креативно)",
-    font=("Arial", 8),
-    fg="#888",
-    bg=BG_COLOR,
-).pack(side="left", padx=5)
-
-notebook = ttk.Notebook(window)
-notebook.pack(fill="x", padx=20, pady=5)
-
-tab_south = tk.Frame(notebook, bg=BG_COLOR)
-notebook.add(tab_south, text="📍 Юга")
-
-tab_vladivostok = tk.Frame(notebook, bg=BG_COLOR)
-notebook.add(tab_vladivostok, text="📍 Владивосток")
-
-tab_east = tk.Frame(notebook, bg=BG_COLOR)
-notebook.add(tab_east, text="📍 Восток")
-
-notebook.bind("<<NotebookTabChanged>>", switch_region)
-
-city_vars = {}
-
-# ===== ЮГА =====
-tk.Label(
-    tab_south, text="📍 Выберите города:", font=("Arial", 10, "bold"), bg=BG_COLOR
-).grid(row=0, column=0, columnspan=3, pady=5)
-row = 1
-for i, city in enumerate(ALL_CITIES_SOUTH):
-    var = IntVar(value=1 if city in SELECTED_CITIES and CURRENT_REGION == "Юга" else 0)
-    city_vars[city] = var
-    Checkbutton(
-        tab_south, text=city, variable=var, font=("Arial", 10), bg=BG_COLOR, cursor="hand2"
-    ).grid(row=row, column=i % 3, padx=15, pady=3, sticky="w")
-    if i % 3 == 2:
-        row += 1
-
-# ===== ВЛАДИВОСТОК =====
-tk.Label(
-    tab_vladivostok, text="📍 Выберите направления:", font=("Arial", 10, "bold"), bg=BG_COLOR
-).grid(row=0, column=0, columnspan=3, pady=5)
-row_vl = 1
-for i, city in enumerate(ALL_CITIES_VLADIVOSTOK):
-    var = IntVar(
-        value=1 if city in SELECTED_CITIES and CURRENT_REGION == "Владивосток" else 0
-    )
-    city_vars[city] = var
-    Checkbutton(
-        tab_vladivostok,
-        text=city,
-        variable=var,
-        font=("Arial", 10),
-        bg=BG_COLOR,
-        cursor="hand2",
-    ).grid(row=row_vl, column=i % 3, padx=15, pady=3, sticky="w")
-    if i % 3 == 2:
-        row_vl += 1
-
-# ===== ВОСТОК =====
-tk.Label(
-    tab_east, text="📍 Выберите города:", font=("Arial", 10, "bold"), bg=BG_COLOR
-).grid(row=0, column=0, columnspan=4, pady=5)
-
-var_creative = IntVar(
-    value=1 if CREATIVE_MODE in SELECTED_CITIES and CURRENT_REGION == "Восток" else 0
-)
-city_vars[CREATIVE_MODE] = var_creative
-Checkbutton(
-    tab_east,
-    text=CREATIVE_MODE,
-    variable=var_creative,
-    font=("Arial", 9, "italic"),
-    bg=BG_COLOR,
-    fg="#FF5722",
-    cursor="hand2",
-).grid(row=1, column=0, columnspan=4, padx=10, pady=5, sticky="w")
-
-row_east = 2
-for i, city in enumerate(ALL_CITIES_EAST):
-    var = IntVar(value=1 if city in SELECTED_CITIES and CURRENT_REGION == "Восток" else 0)
-    city_vars[city] = var
-    Checkbutton(
-        tab_east, text=city, variable=var, font=("Arial", 9), bg=BG_COLOR, cursor="hand2"
-    ).grid(row=row_east, column=i % 4, padx=10, pady=2, sticky="w")
-    if i % 4 == 3:
-        row_east += 1
-
-# ===== ТИП ОПЛАТЫ =====
-# Отдельный выбор, потому что из макета лота оплата нигде не спрашивалась:
-# программа всегда писала «безнал». Формулировка попадает и в промпт ИИ,
-# и в шаблонный текст, и в сохранённые настройки.
-payment_frame = tk.Frame(window, bg=BG_COLOR)
-payment_frame.pack(pady=3)
-
-tk.Label(
-    payment_frame,
-    text="💰 Оплата:",
-    font=("Arial", 10, "bold"),
-    bg=BG_COLOR,
-).pack(side="left", padx=5)
-
-payment_var = tk.StringVar(value=PAYMENT_TYPES[PAYMENT_KEY][0])
-payment_combo = ttk.Combobox(
-    payment_frame,
-    textvariable=payment_var,
-    values=PAYMENT_LABELS,
-    state="readonly",
-    width=18,
-    font=("Arial", 9),
-)
-payment_combo.pack(side="left", padx=5)
-payment_combo.bind("<<ComboboxSelected>>", update_payment)
-
-tk.Button(
-    window,
-    text="✅ ПРИМЕНИТЬ ВЫБОР ГОРОДОВ",
-    font=("Arial", 9, "bold"),
-    bg="#4CAF50",
-    fg="white",
-    padx=20,
-    pady=5,
-    cursor="hand2",
-    command=update_cities,
-).pack(pady=5)
-
-tk.Frame(window, height=2, bg="#ccc").pack(fill="x", padx=20, pady=5)
-
-refresh_button = tk.Button(
-    window,
-    text="🔄 ПОКАЗАТЬ НОВЫЙ ВАРИАНТ",
-    font=("Arial", 10, "bold"),
-    bg="#9C27B0",
-    fg="white",
-    padx=20,
-    pady=8,
-    cursor="hand2",
-    command=refresh_preview_async,
-)
-refresh_button.pack(pady=5)
-
-# Статус фоновой генерации
-gen_status_label = tk.Label(window, text="", font=("Arial", 9), fg="#FF9800", bg=BG_COLOR)
-gen_status_label.pack(pady=2)
-
-text_preview = tk.Text(
-    window, height=13, font=("Arial", 10), wrap="word", relief="solid", bd=1, bg="white"
-)
-text_preview.pack(fill="both", padx=20, pady=10, expand=True)
-text_preview.config(state="disabled")
-
-tk.Label(
-    window,
-    text="💡 Для Востока: отметьте 'Без города' для креативного режима",
-    font=("Arial", 9),
-    bg=BG_COLOR,
-    fg="#888",
-).pack(pady=2)
-
-button_frame = tk.Frame(window, bg=BG_COLOR)
-button_frame.pack(pady=5)
-
-copy_button = tk.Button(
-    button_frame,
-    text="📋 КОПИРОВАТЬ",
-    font=("Arial", 11, "bold"),
-    bg="#4CAF50",
-    fg="white",
-    padx=20,
-    pady=10,
-    width=18,
-    cursor="hand2",
-    command=copy_to_clipboard,
-)
-copy_button.grid(row=0, column=0, padx=5, pady=5)
-
-word_button = tk.Button(
-    button_frame,
-    text="📄 СОХРАНИТЬ WORD",
-    font=("Arial", 11, "bold"),
-    bg="#2196F3",
-    fg="white",
-    padx=20,
-    pady=10,
-    width=18,
-    cursor="hand2",
-    command=save_to_word,
-)
-word_button.grid(row=0, column=1, padx=5, pady=5)
-
-variants_button = tk.Button(
-    button_frame,
-    text="📚 3 ВАРИАНТА",
-    font=("Arial", 11, "bold"),
-    bg="#FF9800",
-    fg="white",
-    padx=20,
-    pady=10,
-    width=18,
-    cursor="hand2",
-    command=save_multiple_variants,
-)
-variants_button.grid(row=0, column=2, padx=5, pady=5)
-
-tk.Button(
-    window,
-    text="✖ ВЫХОД",
-    font=("Arial", 10),
-    bg="#f44336",
-    fg="white",
-    padx=15,
-    pady=5,
-    width=15,
-    cursor="hand2",
-    command=on_exit_button,
-).pack(pady=10)
-
-logger.info("Интерфейс загружен")
-
-# Плашку SSL выставляем сразу после построения окна: если сертификата нет,
-# пользователь видит предупреждение ещё до первого запроса к GigaChat.
-# Повторная (уже без записи в лог) проверка — в _run_gui перед mainloop().
-update_ssl_banner()
 
 
 def _run_gui() -> int:

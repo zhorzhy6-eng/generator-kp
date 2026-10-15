@@ -227,6 +227,7 @@ def install_dependencies() -> bool:
                 "install",
                 "python-docx",
                 "pyperclip",
+                "customtkinter",
                 "requests",
                 "gigachat",
                 "python-dotenv",
@@ -239,7 +240,7 @@ def install_dependencies() -> bool:
 
     # Проверяем, что ключевые модули действительно доступны
     print("\n  Проверка импортов:")
-    required = ["docx", "pyperclip", "tkinter", "PyInstaller"]
+    required = ["docx", "pyperclip", "customtkinter", "tkinter", "PyInstaller"]
     optional = ["gigachat", "dotenv"]
 
     ok = True

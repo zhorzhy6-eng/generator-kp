@@ -26,7 +26,7 @@
 
 import os
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 try:
     PROJECT_ROOT = os.path.dirname(os.path.abspath(SPECPATH))
@@ -55,10 +55,21 @@ hiddenimports += [
     "tkinter.messagebox",
     "tkinter.filedialog",
     "tkinter.scrolledtext",
+    # Интерфейс собран на CustomTkinter — библиотека обязана попасть в сборку
+    "customtkinter",
     "logger_config",
 ]
 
 datas = []
+
+# Ресурсы CustomTkinter: файлы тем, шрифты Roboto и иконка. Библиотека читает
+# их со своего диска при создании окна — без них программа падает при запуске.
+try:
+    ctk_datas = collect_data_files("customtkinter")
+    datas += ctk_datas
+    print(f"[spec] Ресурсы CustomTkinter: {len(ctk_datas)} файлов")
+except Exception as exc:  # pragma: no cover
+    print(f"[spec] ВНИМАНИЕ: не удалось собрать ресурсы customtkinter: {exc}")
 
 settings_example = os.path.join(CONFIG_DIR, "settings.example.json")
 if os.path.isfile(settings_example):
@@ -80,7 +91,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # В шаблонной версии ИИ не используется — выкидываем всё его окружение
+    # В шаблонной версии ИИ не используется — выкидываем всё его окружение.
+    # ВНИМАНИЕ: customtkinter здесь исключать нельзя — на нём собран интерфейс.
     excludes=[
         "matplotlib",
         "numpy",
