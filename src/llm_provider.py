@@ -2158,10 +2158,16 @@ def _generate_gigachat_streaming(
 def _generate_gigachat_sync(
     client: Any, system_prompt: str, prompt: str, temperature: float, max_tokens: int
 ) -> str:
-    """Обычная (непотоковая) генерация — основной режим работы."""
+    """Обычная генерация; параметры Chat сериализуются в тело HTTP-запроса.
+
+    В gigachat 0.2.x chat принимает payload, а не отдельные temperature и
+    messages. Это поля запроса Chat: выносить их в kwargs client.chat нельзя.
+    """
     from gigachat.models import Chat, Messages, MessagesRole
 
     payload = Chat(
+        model=os.environ.get("GIGACHAT_MODEL", DEFAULT_GIGACHAT_MODEL).strip()
+        or DEFAULT_GIGACHAT_MODEL,
         messages=[
             Messages(role=MessagesRole.SYSTEM, content=system_prompt),
             Messages(role=MessagesRole.USER, content=prompt),

@@ -46,6 +46,6 @@
   "region": "Юга",
   "use_ai": true,
   "model": "GigaChat",
-  "creativity": 0.8,
+  "creativity": 0.9,
   "payment": "beznal_nds"
 }
